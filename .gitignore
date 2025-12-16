@@ -6,3 +6,5 @@
 
 # Release tarballs.
 lxc-*.tar.gz*
+
+_*

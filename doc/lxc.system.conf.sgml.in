@@ -1,0 +1,179 @@
+<!-- SPDX-License-Identifier: LGPL-2.1+ -->
+
+<!DOCTYPE refentry PUBLIC @docdtd@ [
+
+<!ENTITY seealso SYSTEM "@builddir@/see_also.sgml">
+]>
+
+<refentry>
+
+  <docinfo><date>@LXC_GENERATE_DATE@</date></docinfo>
+
+  <refmeta>
+    <refentrytitle>lxc.system.conf</refentrytitle>
+    <manvolnum>5</manvolnum>
+  </refmeta>
+
+  <refnamediv>
+    <refname>lxc.system.conf</refname>
+
+    <refpurpose>
+      LXC system configuration file
+    </refpurpose>
+  </refnamediv>
+
+  <refsect1>
+    <title>Description</title>
+
+    <para>
+      The system configuration is located at
+      <filename>@LXC_GLOBAL_CONF@</filename> or
+      <filename>~/.config/lxc/lxc.conf</filename> for unprivileged
+      containers.
+    </para>
+
+    <para>
+      This configuration file is used to set values such as default
+      lookup paths and storage backend settings for LXC.
+    </para>
+
+    <refsect2>
+      <title>Configuration paths</title>
+
+      <variablelist>
+        <varlistentry>
+          <term>
+            <option>lxc.lxcpath</option>
+          </term>
+          <listitem>
+            <para>
+              The location in which all containers are stored.
+            </para>
+          </listitem>
+        </varlistentry>
+        <varlistentry>
+          <term>
+            <option>lxc.default_config</option>
+          </term>
+          <listitem>
+            <para>
+              The path to the default container configuration.
+            </para>
+          </listitem>
+        </varlistentry>
+      </variablelist>
+    </refsect2>
+
+    <refsect2>
+      <title>Control Groups</title>
+
+      <variablelist>
+        <varlistentry>
+          <term>
+            <option>lxc.cgroup.use</option>
+          </term>
+          <listitem>
+            <para>
+              Comma separated list of cgroup controllers to setup.
+              If none is specified, all available controllers will be used.
+            </para>
+          </listitem>
+        </varlistentry>
+        <varlistentry>
+          <term>
+            <option>lxc.cgroup.pattern</option>
+          </term>
+          <listitem>
+            <para>
+              Format string used to generate the cgroup path (e.g. lxc/%n).
+            </para>
+          </listitem>
+        </varlistentry>
+      </variablelist>
+    </refsect2>
+
+    <refsect2>
+      <title>LVM</title>
+
+      <variablelist>
+        <varlistentry>
+          <term>
+            <option>lxc.bdev.lvm.vg</option>
+          </term>
+          <listitem>
+            <para>
+              Default LVM volume group name.
+            </para>
+          </listitem>
+        </varlistentry>
+        <varlistentry>
+          <term>
+            <option>lxc.bdev.lvm.thin_pool</option>
+          </term>
+          <listitem>
+            <para>
+              Default LVM thin pool name.
+            </para>
+          </listitem>
+        </varlistentry>
+      </variablelist>
+    </refsect2>
+
+    <refsect2>
+      <title>ZFS</title>
+
+      <variablelist>
+        <varlistentry>
+          <term>
+            <option>lxc.bdev.zfs.root</option>
+          </term>
+          <listitem>
+            <para>
+              Default ZFS root name.
+            </para>
+          </listitem>
+        </varlistentry>
+      </variablelist>
+    </refsect2>
+  </refsect1>
+
+  <refsect1>
+    <simpara>
+      <citerefentry>
+        <refentrytitle><command>lxc</command></refentrytitle>
+        <manvolnum>1</manvolnum>
+      </citerefentry>,
+      <citerefentry>
+        <refentrytitle><command>lxc.container.conf</command></refentrytitle>
+        <manvolnum>5</manvolnum>
+      </citerefentry>,
+      <citerefentry>
+        <refentrytitle><command>lxc.system.conf</command></refentrytitle>
+        <manvolnum>5</manvolnum>
+      </citerefentry>,
+      <citerefentry>
+        <refentrytitle><command>lxc-usernet</command></refentrytitle>
+        <manvolnum>5</manvolnum>
+      </citerefentry>
+    </simpara>
+  </refsect1>
+
+  &seealso;
+</refentry>
+
+<!-- Keep this comment at the end of the file
+Local variables:
+mode: sgml
+sgml-omittag:t
+sgml-shorttag:t
+sgml-minimize-attributes:nil
+sgml-always-quote-attributes:t
+sgml-indent-step:2
+sgml-indent-data:t
+sgml-parent-document:nil
+sgml-default-dtd-file:nil
+sgml-exposed-tags:nil
+sgml-local-catalogs:nil
+sgml-local-ecat-files:nil
+End:
+-->

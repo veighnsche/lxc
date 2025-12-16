@@ -1,0 +1,34 @@
+#!/bin/sh
+
+# SPDX-License-Identifier: LGPL-2.1+
+
+# lxc: linux Container library
+
+set -e
+
+FAIL() {
+	echo -n "Failed " >&2
+	echo "$*" >&2
+	lxc-destroy -n busy -f
+	exit 1
+}
+
+# Create a container
+lxc-create -t busybox -n busy || FAIL "creating busybox container"
+
+# Run lxc-execute to make sure it fails when the command fails, and
+# succeed when the command succeeds.
+lxc-execute -n busy -- sh -c 'exit 1' && FAIL "should be failing" || true
+lxc-execute -n busy -- sh -c 'exit 0' || FAIL "should be succeeding"
+
+# Now, start the container and wait for it to be in running state.
+lxc-start -n busy -d || FAIL "starting busybox container"
+lxc-wait -n busy -s RUNNING || FAIL "waiting for busybox container to run"
+
+# And run the same tests on lxc-attach.
+lxc-attach -n busy -- sh -c 'exit 1' && FAIL "should be failing" || true
+lxc-attach -n busy -- sh -c 'exit 0' || FAIL "should be succeeding"
+
+lxc-destroy -n busy -f
+
+exit 0

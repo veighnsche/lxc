@@ -1,0 +1,83 @@
+<!-- SPDX-License-Identifier: LGPL-2.1+ -->
+
+<!DOCTYPE refentry PUBLIC @docdtd@ [
+
+<!ENTITY seealso SYSTEM "@builddir@/see_also.sgml">
+]>
+
+<refentry>
+
+  <docinfo><date>@LXC_GENERATE_DATE@</date></docinfo>
+
+  <refmeta>
+    <refentrytitle>lxc-checkconfig</refentrytitle>
+    <manvolnum>1</manvolnum>
+  </refmeta>
+
+  <refnamediv>
+    <refname>lxc-checkconfig</refname>
+
+    <refpurpose>
+      <!--
+      check the current kernel for lxc support
+      -->
+      現在のカーネルが lxc に必要な機能をサポートしているかのチェック
+    </refpurpose>
+  </refnamediv>
+
+  <refsynopsisdiv>
+    <cmdsynopsis>
+      <command>lxc-checkconfig</command>
+    </cmdsynopsis>
+  </refsynopsisdiv>
+
+  <refsect1>
+    <title><!-- Description -->説明</title>
+    <para>
+      <!--
+      <command>lxc-checkconfig</command> check the current kernel for
+      lxc support
+      -->
+      <command>lxc-checkconfig</command> は、現在のカーネルが lxc に必要な機能をサポートしているかをチェックします。
+    </para>
+  </refsect1>
+
+  <refsect1>
+    <title><!-- Examples -->例</title>
+    <variablelist>
+      <varlistentry>
+        <term>lxc-checkconfig</term>
+        <listitem>
+        <para>
+          <!--
+          check the current kernel.
+          CONFIG can be set in the environment to an alternate location.
+          -->
+          現在のカーネルをチェックします。
+          CONFIG 環境変数に別の場所を設定することも可能です。
+          (訳注: カーネルビルド時の設定オプションのファイルの位置を指定します。デフォルトは /proc/config.gz です。)
+        </para>
+        </listitem>
+      </varlistentry>
+    </variablelist>
+  </refsect1>
+
+  &seealso;
+</refentry>
+
+<!-- Keep this comment at the end of the file
+Local variables:
+mode: sgml
+sgml-omittag:t
+sgml-shorttag:t
+sgml-minimize-attributes:nil
+sgml-always-quote-attributes:t
+sgml-indent-step:2
+sgml-indent-data:t
+sgml-parent-document:nil
+sgml-default-dtd-file:nil
+sgml-exposed-tags:nil
+sgml-local-catalogs:nil
+sgml-local-ecat-files:nil
+End:
+-->

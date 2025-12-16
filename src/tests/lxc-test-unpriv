@@ -1,0 +1,159 @@
+#!/bin/bash
+
+# SPDX-License-Identifier: LGPL-2.1+
+
+# lxc: linux Container library
+#
+# This is a test script for unprivileged containers
+#
+# This test assumes an Ubuntu host
+
+if [ $(id -u) -ne 0 ]; then
+	echo "ERROR: Must run as root."
+	exit 1
+fi
+
+# Test if we're using an overlayfs module that handles symlinks correctly. If
+# not, we skip these tests since overlay clones will not work correctly.
+if modprobe -q overlayfs; then
+        TMPDIR=$(mktemp -d)
+
+        MOUNTDIR="${TMPDIR}/ovl_symlink_test"
+
+        mkdir ${MOUNTDIR}
+
+        mount -t tmpfs none ${MOUNTDIR}
+
+        mkdir ${MOUNTDIR}/{lowerdir,upperdir,workdir,overlayfs}
+        mount -t overlayfs -o lowerdir="${MOUNTDIR}/lowerdir",upperdir="${MOUNTDIR}/upperdir",workdir="${MOUNTDIR}/workdir" none "${MOUNTDIR}/overlayfs"
+
+        CORRECT_LINK_TARGET="${MOUNTDIR}/overlayfs/placeholder_file"
+        exec 9> "${CORRECT_LINK_TARGET}"
+
+        DETECTED_LINK_TARGET=$(readlink -q /proc/$$/fd/9)
+
+        # cleanup
+        exec 9>&-
+
+        umount "${MOUNTDIR}/overlayfs"
+        umount ${MOUNTDIR}
+
+        rmdir ${MOUNTDIR}
+
+        # This overlay module does not correctly handle symlinks, so skip the
+        # tests.
+        if [ "${DETECTED_LINK_TARGET}" != "${CORRECT_LINK_TARGET}" ]; then
+                exit 0
+        fi
+fi
+
+command -v newuidmap >/dev/null 2>&1 || { echo "'newuidmap' command is missing" >&2; exit 1; }
+
+DONE=0
+UNPRIV_LOG=$(mktemp --dry-run)
+cleanup() {
+	cd /
+
+	if [ $DONE -eq 0 ]; then
+		cat "${UNPRIV_LOG}"
+	fi
+	rm -f "${UNPRIV_LOG}" || true
+
+	run_cmd lxc-stop -n c2 -k -l trace -o "${UNPRIV_LOG}" || true
+	run_cmd lxc-stop -n c1 -k -l trace -o "${UNPRIV_LOG}" || true
+	pkill -u $(id -u $TUSER) -9 || true
+
+	sed -i '/lxcunpriv/d' /run/lxc/nics /etc/lxc/lxc-usernet
+	sed -i '/^lxcunpriv:/d' /etc/subuid /etc/subgid
+
+	rm -Rf $HDIR /run/user/$(id -u $TUSER) || true
+
+	deluser $TUSER
+
+	if [ $DONE -eq 0 ]; then
+		echo "FAIL"
+		exit 1
+	fi
+
+	echo "PASS"
+}
+
+run_cmd() {
+	sudo -i -u $TUSER \
+	    env http_proxy=${http_proxy:-} https_proxy=${https_proxy:-} \
+	        XDG_RUNTIME_DIR=/run/user/$(id -u $TUSER) ASAN_OPTIONS=${ASAN_OPTIONS:-} \
+		UBSAN_OPTIONS=${UBSAN_OPTIONS:-} $*
+}
+
+# create a test user
+TUSER=lxcunpriv
+HDIR=/home/$TUSER
+
+trap cleanup EXIT SIGHUP SIGINT SIGTERM
+set -eux
+
+id $TUSER &> /dev/null && deluser -q --remove-home $TUSER
+useradd $TUSER
+
+mkdir -p $HDIR
+echo "$TUSER veth lxcbr0 2" >> /etc/lxc/lxc-usernet
+sed -i '/^lxcunpriv:/d' /etc/subuid /etc/subgid
+
+usermod -v 910000-919999 -w 910000-919999 $TUSER
+
+mkdir -p $HDIR/.config/lxc/
+cat > $HDIR/.config/lxc/default.conf << EOF
+lxc.net.0.type = veth
+lxc.net.0.link = lxcbr0
+lxc.idmap = u 0 910000 9999
+lxc.idmap = g 0 910000 9999
+EOF
+chown -R $TUSER: $HDIR
+
+mkdir -p /run/user/$(id -u $TUSER)
+chown -R $TUSER: /run/user/$(id -u $TUSER)
+
+cd $HDIR
+
+run_cmd lxc-create -t busybox -n c1 -l trace -o "${UNPRIV_LOG}"
+
+# Make sure we can start it - twice
+
+for count in $(seq 1 2); do
+    run_cmd lxc-start -n c1 -d -l trace -o "${UNPRIV_LOG}"
+
+    p1=$(run_cmd lxc-info -n c1 -p -H -l trace -o "${UNPRIV_LOG}")
+    [ "$p1" != "-1" ] || { echo "Failed to start container c1 (run $count)"; false; }
+
+    run_cmd lxc-info -n c1 -l trace -o "${UNPRIV_LOG}"
+    run_cmd lxc-attach -n c1 -l trace -o "${UNPRIV_LOG}" -- /bin/true
+
+    run_cmd lxc-stop -n c1 -k -l trace -o "${UNPRIV_LOG}"
+done
+
+run_cmd lxc-copy -s -n c1 -N c2 -l trace -o "${UNPRIV_LOG}"
+run_cmd lxc-start -n c2 -d -l trace -o "${UNPRIV_LOG}"
+p1=$(run_cmd lxc-info -n c2 -p -H -l trace -o "${UNPRIV_LOG}")
+[ "$p1" != "-1" ] || { echo "Failed to start container c2"; false; }
+
+run_cmd lxc-stop -n c2 -k -l trace -o "${UNPRIV_LOG}"
+
+if command -v cgm >/dev/null 2>&1; then
+    echo "Testing containers under different cgroups per subsystem"
+    run_cmd cgm create freezer x1/x2
+    cgm movepid freezer x1 $$
+    run_cmd lxc-start -n c1 -d -l trace -o "${UNPRIV_LOG}"
+    p1=$(run_cmd lxc-info -n c1 -p -H -l trace -o "${UNPRIV_LOG}")
+    [ "$p1" != "-1" ] || { echo "Failed to start container c1"; false; }
+    run_cmd lxc-info -n c1 -l trace -o "${UNPRIV_LOG}"
+    run_cmd lxc-attach -n c1 -l trace -o "${UNPRIV_LOG}" -- /bin/true
+    run_cmd lxc-cgroup -n c1 freezer.state -l trace -o "${UNPRIV_LOG}"
+
+    echo "Testing lxc-attach and lxc-cgroup from different cgroup"
+    cgm movepid freezer x2 $$
+    run_cmd lxc-attach -n c1 -l trace -o "${UNPRIV_LOG}" -- /bin/true
+    run_cmd lxc-cgroup -n c1 -l trace -o "${UNPRIV_LOG}" freezer.state
+    run_cmd lxc-cgroup -n c1 -l trace -o "${UNPRIV_LOG}" memory.limit_in_bytes
+fi
+
+DONE=1

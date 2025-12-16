@@ -1,0 +1,29 @@
+#!/bin/bash
+
+# SPDX-License-Identifier: LGPL-2.1+
+
+# lxc: linux Container library
+
+# Ensure that when /proc and/or /sys do not exist in the container,
+# it is started successfully anyway.
+
+set -ex
+FAIL() {
+	echo -n "Failed " >&2
+	echo "$*" >&2
+	lxc-destroy -n lxc-test-procsys -f
+	exit 1
+}
+
+lxc-destroy -n lxc-test-procsys -f || :
+lxc-create -t busybox -n lxc-test-procsys
+rmdir /var/lib/lxc/lxc-test-procsys/rootfs/{proc,sys}
+
+lxc-start -n lxc-test-procsys
+lxc-wait -n lxc-test-procsys -s RUNNING || FAIL "waiting for busybox container to run"
+
+lxc-attach -n lxc-test-procsys -- sh -c 'test -f /proc/version' || FAIL "/proc/version not found"
+lxc-attach -n lxc-test-procsys -- sh -c 'test -d /sys/fs' || FAIL "/sys/fs not found"
+
+lxc-destroy -n lxc-test-procsys -f
+exit 0

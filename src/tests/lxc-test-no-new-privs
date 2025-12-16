@@ -1,0 +1,54 @@
+#!/bin/bash
+
+# SPDX-License-Identifier: LGPL-2.1+
+
+# lxc: linux Container library
+
+# This is a test script for PR_SET_NO_NEW_PRIVS
+
+set -eux
+
+DONE=0
+cleanup() {
+	cd /
+	lxc-destroy -n c1 -f || true
+	if [ $DONE -eq 0 ]; then
+		echo "FAIL"
+		exit 1
+	fi
+	echo "PASS"
+}
+
+trap cleanup EXIT SIGHUP SIGINT SIGTERM
+
+if [ ! -d /etc/lxc ]; then
+    mkdir -p /etc/lxc/
+    cat > /etc/lxc/default.conf << EOF
+lxc.net.0.type = veth
+lxc.net.0.link = lxcbr0
+EOF
+fi
+
+lxc-create -t busybox -n c1
+echo "lxc.no_new_privs = 1" >> /var/lib/lxc/c1/config
+
+lxc-start -n c1
+p1=$(lxc-info -n c1 -p -H)
+[ "$p1" != "-1" ] || { echo "Failed to start container c1"; false; }
+
+lxc-attach -n c1 --clear-env -- mkdir -p /home/ubuntu
+lxc-attach -n c1 --clear-env -- /bin/sh -c "cat <<EOF >> /etc/passwd
+ubuntu:x:1000:1000:ubuntu:/home/ubuntu:/bin/sh
+EOF"
+
+# Check that lxc-attach obeys PR_SET_NO_NEW_PRIVS when it is set.
+! lxc-attach -n c1 --clear-env --uid 1000 --gid 1000 -- ping -c 1 127.0.0.1 || { echo "Managed to ping localhost"; false; }
+lxc-stop -n c1 -k
+
+# Check that lxc-attach obeys PR_SET_NO_NEW_PRIVS when it is not set.
+sed -i 's/lxc.no_new_privs = 1/lxc.no_new_privs = 0/' /var/lib/lxc/c1/config
+lxc-start -n c1
+lxc-attach -n c1 --clear-env --uid 1000 --gid 1000 -- ping -c 1 127.0.0.1 || { echo "Managed to ping localhost"; false; }
+lxc-stop -n c1 -k
+
+DONE=1

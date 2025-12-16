@@ -1,0 +1,173 @@
+<!-- SPDX-License-Identifier: LGPL-2.1+ -->
+
+<!DOCTYPE refentry PUBLIC @docdtd@ [
+
+<!ENTITY seealso SYSTEM "@builddir@/see_also.sgml">
+]>
+
+<refentry>
+
+  <docinfo><date>@LXC_GENERATE_DATE@</date></docinfo>
+
+  <refmeta>
+    <refentrytitle>lxc-device</refentrytitle>
+    <manvolnum>1</manvolnum>
+  </refmeta>
+
+  <refnamediv>
+    <refname>lxc-device</refname>
+
+    <refpurpose>
+      <!--
+      manage devices of running containers
+      -->
+      実行中のコンテナのデバイスの管理
+    </refpurpose>
+  </refnamediv>
+
+  <refsynopsisdiv>
+    <cmdsynopsis>
+      <command>lxc-device</command>
+      <arg choice="opt">-h</arg>
+      <arg choice="opt">-n <replaceable>name</replaceable></arg>
+      <arg choice="opt">add</arg>
+      <arg choice="opt">DEVICE</arg>
+      <arg choice="opt">NAME</arg>
+    </cmdsynopsis>
+  </refsynopsisdiv>
+
+  <refsect1>
+    <title><!-- Description -->説明</title>
+    <para>
+      <!--
+      <command>lxc-device</command> manages devices in running container.
+      -->
+      <command>lxc-device</command> は実行中のコンテナのデバイスを管理します。
+    </para>
+  </refsect1>
+
+  <refsect1>
+    <title><!-- Options -->オプション</title>
+    <variablelist>
+      <varlistentry>
+        <term>
+          <option>-h</option>
+        </term>
+        <listitem>
+          <para>
+            <!--
+            The full command help message.
+            -->
+            コマンドのヘルプを表示します。
+          </para>
+        </listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><option>-n, --name=<replaceable>NAME</replaceable></option></term>
+        <listitem>
+          <para>
+            <!--
+             The name of the target container.
+             -->
+            対象のコンテナの名前
+          </para>
+        </listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term>
+          <option>action</option>
+        </term>
+        <listitem>
+          <para>
+            <!--
+            What action to perform. Only 'add' is supported at this point.
+            -->
+            実行するアクション。現時点では 'add' のみ指定できます。
+          </para>
+        </listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term>
+          <option>DEVICE</option>
+        </term>
+        <listitem>
+          <para>
+            <!--
+            The device to add to the container.
+            It can either be the path to a device under /dev or a network
+            interface name.
+            -->
+            コンテナに追加するデバイス。
+            /dev 以下のデバイスのパスかネットワークインターフェース名を指定できます。
+          </para>
+        </listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term>
+          <option><optional>NAME</optional></option>
+        </term>
+        <listitem>
+          <para>
+            <!--
+            Name for the device within the container.
+            -->
+            コンテナ内でのデバイスの名前
+          </para>
+        </listitem>
+      </varlistentry>
+    </variablelist>
+  </refsect1>
+
+  <refsect1>
+    <title><!-- Examples -->例</title>
+    <variablelist>
+      <varlistentry>
+        <term>lxc-device -n p1 add /dev/video0</term>
+        <listitem>
+        <para>
+          <!--
+          Creates a /dev/video0 device in container p1 based on the matching
+          device on the host.
+          -->
+          コンテナ p1 内に、ホスト上でマッチするデバイスに基づいて /dev/video0 デバイスを作製します。
+        </para>
+        </listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term>lxc-device -n p1 add eth0 eth1</term>
+        <listitem>
+        <para>
+          <!--
+           Moves eth0 from the host as eth1 in p1.
+           -->
+          eth0 をホストから p1 内の eth1 に移動します。
+        </para>
+        </listitem>
+      </varlistentry>
+    </variablelist>
+  </refsect1>
+
+  &seealso;
+</refentry>
+
+<!-- Keep this comment at the end of the file
+Local variables:
+mode: sgml
+sgml-omittag:t
+sgml-shorttag:t
+sgml-minimize-attributes:nil
+sgml-always-quote-attributes:t
+sgml-indent-step:2
+sgml-indent-data:t
+sgml-parent-document:nil
+sgml-default-dtd-file:nil
+sgml-exposed-tags:nil
+sgml-local-catalogs:nil
+sgml-local-ecat-files:nil
+End:
+-->

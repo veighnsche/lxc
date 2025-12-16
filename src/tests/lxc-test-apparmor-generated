@@ -1,0 +1,55 @@
+#!/bin/sh
+
+# SPDX-License-Identifier: LGPL-2.1+
+
+# lxc: linux Container library
+
+# This is a test script for generated apparmor profiles
+
+if ! command -v apparmor_parser >/dev/null 2>&1; then
+	echo 'SKIP: test for generated apparmor profiles: apparmor_parser missing'
+	exit 0
+fi
+
+DONE=0
+LOGFILE="/tmp/lxc-test-$$.log"
+cleanup() {
+	lxc-destroy -n $CONTAINER_NAME >/dev/null 2>&1 || true
+
+	if [ $DONE -eq 0 ]; then
+		[ -f "$LOGFILE" ] && cat "$LOGFILE" >&2
+		rm -f "$LOGFILE"
+		echo "FAIL"
+		exit 1
+	fi
+	rm -f "$LOGFILE"
+	echo "PASS"
+}
+
+trap cleanup EXIT HUP INT TERM
+set -eu
+
+# Create a container
+CONTAINER_NAME=lxc-test-apparmor-generated
+
+lxc-create -t busybox -n $CONTAINER_NAME -B dir
+CONTAINER_PATH=$(dirname $(lxc-info -n $CONTAINER_NAME -c lxc.rootfs.path -H) | sed -e 's/dir://')
+cp $CONTAINER_PATH/config $CONTAINER_PATH/config.bak
+
+# Set the profile to be auto-generated
+echo "lxc.apparmor.profile = generated" >> $CONTAINER_PATH/config
+
+# Start it
+lxc-start -n $CONTAINER_NAME -lDEBUG -o "$LOGFILE"
+lxc-wait -n $CONTAINER_NAME -t 5 -s RUNNING || (echo "Container didn't start" && exit 1)
+pid=$(lxc-info -p -H -n $CONTAINER_NAME)
+profile=$(cat /proc/$pid/attr/current)
+expected_profile="lxc-${CONTAINER_NAME}_</var/lib/lxc>//&:lxc-${CONTAINER_NAME}_<-var-lib-lxc>:unconfined (enforce)"
+lxc-stop -n $CONTAINER_NAME -k
+if [ "x$profile" != "x$expected_profile" ]; then
+	echo "FAIL: container was in profile $profile" >&2
+	echo "expected profile: $expected_profile" >&2
+	exit 1
+fi
+
+DONE=1

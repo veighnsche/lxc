@@ -1,0 +1,27 @@
+#!/bin/bash
+
+# SPDX-License-Identifier: LGPL-2.1+
+
+# lxc: linux Container library
+#
+# This is a test script for the lxc-user-nic program
+
+set -e
+
+s=$(mktemp -d /tmp/lxctest-XXXXXX)
+f="$s/in.conf"
+
+cleanup() {
+	lxc-destroy -n lxctestc || true
+	rm -rf $s
+}
+
+trap cleanup EXIT
+
+cat > $f << EOF
+lxc.net.0.type = veth
+lxc.net.0.hwaddr = 10:66:6a:xx:xx:xx
+EOF
+lxc-create -t busybox -f $f -n lxctestc
+grep -q "xx:xx" /var/lib/lxc/lxctestc/config && { echo "hwaddr not expanded"; exit 1; }
+echo "Success"

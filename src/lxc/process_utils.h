@@ -164,7 +164,8 @@
 #define u64_to_ptr(x) ((void *)(uintptr_t)x)
 #endif
 
-#if !HAVE_STRUCT_CLONE_ARGS
+/* TEAM_001: Also check for linux/sched.h definition (NDK r27+) */
+#if !HAVE_STRUCT_CLONE_ARGS && !defined(__ANDROID__)
 struct clone_args {
 	__aligned_u64 flags;
 	__aligned_u64 pidfd;

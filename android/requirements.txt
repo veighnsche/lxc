@@ -1,0 +1,4 @@
+# Deploy script dependencies
+rich>=13.0.0      # Terminal output, progress bars, tables
+typer>=0.9.0      # Modern CLI with type hints
+httpx>=0.25.0     # HTTP client (replaces curl subprocess)

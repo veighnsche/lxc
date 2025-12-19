@@ -1,0 +1,19 @@
+#!/bin/bash
+# lxc-shell - Wrapper to run commands in the Gentoo LXC container
+# Usage: adb push lxc-shell /data/local/tmp/lxc-shell
+#        adb shell su -c '/data/local/tmp/lxc-shell <command>'
+#        adb shell su -c '/data/local/tmp/lxc-shell'  # interactive shell
+
+export XDG_RUNTIME_DIR=/data/local/tmp/lxc-run
+export LD_LIBRARY_PATH=/data/local/tmp/lxc/lib
+export LXC_PATH=/data/lxc/containers
+
+LXC_BIN=/data/local/tmp/lxc/bin
+
+if [ $# -eq 0 ]; then
+    # Interactive shell
+    exec $LXC_BIN/lxc-attach -n gentoo -P $LXC_PATH -e -- /bin/bash -l
+else
+    # Run command
+    exec $LXC_BIN/lxc-attach -n gentoo -P $LXC_PATH -e -- "$@"
+fi

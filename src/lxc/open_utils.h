@@ -19,7 +19,8 @@
  * @mode: O_CREAT/O_TMPFILE file mode.
  * @resolve: RESOLVE_* flags.
  */
-#if !HAVE_STRUCT_OPEN_HOW
+/* TEAM_001: Also check for linux/openat2.h definition (NDK r27+) */
+#if !HAVE_STRUCT_OPEN_HOW && !defined(__ANDROID__)
 struct open_how {
 	__u64 flags;
 	__u64 mode;

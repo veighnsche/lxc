@@ -1,0 +1,11 @@
+#!/bin/bash
+# g - Quick wrapper to run commands in Gentoo container
+# Usage: ./g <command>
+#        ./g  # interactive shell
+
+if [ $# -eq 0 ]; then
+    adb shell su -c "sh /data/local/tmp/lxc-shell"
+else
+    # Wrap in bash -c for shell builtins like cd
+    adb shell su -c "sh /data/local/tmp/lxc-shell /bin/bash -c '$*'"
+fi

@@ -129,12 +129,32 @@ class DevicePaths:
 
 @dataclass
 class NetworkConfig:
-    """Container networking configuration."""
+    """Container networking configuration.
+    
+    TEAM_008: Two modes supported:
+    - mode='bridge': Internal NAT network (10.0.3.x) - isolated but requires port forwarding
+    - mode='macvlan': Real IP on home network (192.168.178.x) - direct SSH access
+    
+    For secrets vault use case, macvlan is preferred for direct SSH access.
+    """
+    # Network mode: 'bridge' (internal NAT) or 'macvlan' (real IP on LAN)
+    # TEAM_008: macvlan doesn't work on wlan0 (WiFi driver limitation), using bridge
+    mode: str = "bridge"
+    
+    # Bridge mode settings (used when mode='bridge')
     bridge: str = "lxcbr0"
-    subnet: str = "10.0.3.0/24"
-    gateway: str = "10.0.3.1"
-    container_ip: str = "10.0.3.2"
-    host_interface: str = "wlan0"
+    bridge_subnet: str = "10.0.3.0/24"
+    bridge_gateway: str = "10.0.3.1"
+    bridge_container_ip: str = "10.0.3.2"
+    
+    # Macvlan mode settings (used when mode='macvlan')
+    # Container gets a real IP on your home network!
+    container_ip: str = "192.168.178.100"  # Pick an unused IP on your LAN
+    container_gateway: str = "192.168.178.1"  # Your router IP
+    container_netmask: str = "24"
+    
+    # Auto-detected at runtime if None; common interfaces: wlan0, rmnet_data0, eth0
+    host_interface: Optional[str] = None
 
 
 @dataclass
@@ -200,126 +220,289 @@ class Config:
     timeout_medium: int = 60
     timeout_long: int = 300
     container_ready_timeout: int = 30
+    container_ready_poll_interval: float = 0.5
 
 
 # =============================================================================
-# ADB - Android Debug Bridge wrapper
+# Device Shell - Primary interface for all device operations
+# =============================================================================
+
+class DeviceShell:
+    """Persistent root shell - THE way to interact with the device.
+    
+    TEAM_002: Complete rewrite around interactive shell paradigm.
+    
+    Instead of the old nightmare:
+        adb shell su -c "echo 'hello'"     # Quoting hell
+        adb shell su -c "cat '/path'"      # More quoting
+        adb shell su -c "cmd with $vars"   # Escaping madness
+    
+    We now have ONE persistent shell:
+        shell.run("echo 'hello'")          # Just works
+        shell.run("cat /path")             # No escaping needed
+        shell.run(f"cmd with {vars}")      # Python f-strings work
+    
+    The shell stays open for the entire session. Commands are sent
+    via stdin, output read via stdout. A unique marker detects
+    when each command completes.
+    """
+    
+    _MARKER = "__END_CMD_a9f8e7d6__"
+    
+    def __init__(self, serial: Optional[str] = None):
+        self.serial = serial
+        self._proc: Optional[subprocess.Popen] = None
+        self._adb_base = ["adb"] + (["-s", serial] if serial else [])
+    
+    def connect(self) -> bool:
+        """Establish persistent root shell connection."""
+        if self._proc and self._proc.poll() is None:
+            return True
+        
+        try:
+            # TEAM_004: Use 'su 0 sh' instead of 'su' to get full capabilities
+            # Android's 'su' drops capabilities, but 'su 0 sh' preserves them
+            # This is required for bridge/veth creation
+            self._proc = subprocess.Popen(
+                self._adb_base + ["shell", "su", "0", "sh"],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+            )
+            # Verify root
+            out, rc = self._exec("id -u", timeout=5)
+            return out.strip() == "0"
+        except Exception as e:
+            log_warn(f"Shell connect failed: {e}")
+            self.disconnect()
+            return False
+    
+    def disconnect(self) -> None:
+        """Close the shell session."""
+        if self._proc:
+            try:
+                self._proc.stdin.write("exit\n")
+                self._proc.stdin.flush()
+                self._proc.wait(timeout=2)
+            except Exception:
+                try:
+                    self._proc.kill()
+                except Exception:
+                    pass
+            self._proc = None
+    
+    def _exec(self, cmd: str, timeout: Optional[int] = None) -> tuple[str, int]:
+        """Execute command and return (stdout, returncode)."""
+        if not self._proc or self._proc.poll() is not None:
+            raise RuntimeError("Shell not connected")
+        
+        # Send command + marker with exit code
+        self._proc.stdin.write(f"{cmd}; echo {self._MARKER}$?\n")
+        self._proc.stdin.flush()
+        
+        # Read until marker
+        lines = []
+        start = time.time()
+        while True:
+            if timeout and (time.time() - start) > timeout:
+                raise TimeoutError(f"Command timed out: {cmd[:60]}")
+            
+            line = self._proc.stdout.readline()
+            if not line:
+                raise RuntimeError("Shell died unexpectedly")
+            
+            if self._MARKER in line:
+                try:
+                    rc = int(line.split(self._MARKER)[1].strip())
+                except (IndexError, ValueError):
+                    rc = 0
+                return "".join(lines), rc
+            lines.append(line)
+    
+    @property
+    def alive(self) -> bool:
+        return self._proc is not None and self._proc.poll() is None
+    
+    # -------------------------------------------------------------------------
+    # Shell Operations - All go through the persistent session
+    # -------------------------------------------------------------------------
+    
+    def run(self, cmd: str, timeout: Optional[int] = None, check: bool = True) -> tuple[str, int]:
+        """Run command as root. Returns (output, returncode)."""
+        if not self.alive:
+            if not self.connect():
+                raise RuntimeError("Cannot establish root shell")
+        return self._exec(cmd, timeout)
+    
+    def run_ok(self, cmd: str, timeout: Optional[int] = None) -> bool:
+        """Run command, return True if exit code is 0."""
+        _, rc = self.run(cmd, timeout, check=False)
+        return rc == 0
+    
+    def run_output(self, cmd: str, timeout: Optional[int] = None) -> str:
+        """Run command, return stdout (ignore exit code)."""
+        out, _ = self.run(cmd, timeout, check=False)
+        return out.strip()
+    
+    def exists(self, path: str, is_dir: bool = False) -> bool:
+        """Check if path exists on device."""
+        flag = "-d" if is_dir else "-e"
+        return self.run_ok(f"[ {flag} {path} ]")
+    
+    def mkdir(self, path: str) -> None:
+        """Create directory (and parents)."""
+        self.run(f"mkdir -p {path}")
+    
+    def rm(self, path: str) -> None:
+        """Remove file or directory."""
+        self.run(f"rm -rf {path}", check=False)
+    
+    def cat(self, path: str) -> str:
+        """Read file contents."""
+        return self.run_output(f"cat {path}")
+    
+    def is_mounted(self, path: str) -> bool:
+        """Check if path is a mountpoint."""
+        return self.run_ok(f"mountpoint -q {path}")
+    
+    def mount(self, image: str, mountpoint: str) -> None:
+        """Mount image at mountpoint."""
+        self.mkdir(mountpoint)
+        self.run(f"mount -o loop,rw,suid,dev,exec {image} {mountpoint}")
+        log_ok(f"Mounted at {mountpoint}")
+    
+    def umount(self, path: str) -> bool:
+        """Unmount path."""
+        return self.run_ok(f"umount {path}")
+    
+    def create_ext4_image(self, path: str, size_mb: int) -> None:
+        """Create sparse ext4 image."""
+        log(f"Creating {size_mb}MB ext4 image...")
+        self.run(f"dd if=/dev/zero of={path} bs=1M count=0 seek={size_mb}", timeout=60)
+        self.run(f"mkfs.ext4 -F {path}", timeout=120)
+        log_ok(f"Image created: {path}")
+
+
+# =============================================================================
+# ADB - File transfers and connection checks (shell ops delegated)
 # =============================================================================
 
 class ADB:
-    """Clean ADB interface - no shell quoting issues."""
+    """ADB wrapper - handles file transfers, delegates shell to DeviceShell."""
     
     def __init__(self, serial: Optional[str] = None):
         self.serial = serial
         self._base = ["adb"] + (["-s", serial] if serial else [])
+        self.shell = DeviceShell(serial)  # THE shell interface
     
-    def _run(self, args: list[str], check: bool = True, 
-             timeout: Optional[int] = None) -> subprocess.CompletedProcess:
-        cmd = self._base + args
-        try:
-            result = subprocess.run(cmd, capture_output=True, text=True, 
-                                   timeout=timeout, check=False)
-            if check and result.returncode != 0:
-                raise subprocess.CalledProcessError(result.returncode, cmd, 
-                                                   result.stdout, result.stderr)
-            return result
-        except subprocess.TimeoutExpired:
-            raise RuntimeError(f"ADB timeout: {' '.join(args[:2])}...")
+    def _adb(self, args: list[str], timeout: Optional[int] = None) -> subprocess.CompletedProcess:
+        """Run raw adb command."""
+        return subprocess.run(
+            self._base + args,
+            capture_output=True, text=True, timeout=timeout
+        )
     
-    # Connection
     def connected(self) -> bool:
+        """Check if device is connected."""
         try:
-            r = self._run(["get-state"], check=False, timeout=5)
+            r = self._adb(["get-state"], timeout=5)
             return r.returncode == 0 and "device" in r.stdout
         except Exception:
             return False
     
     def serial_number(self) -> str:
-        return self._run(["get-serialno"], timeout=5).stdout.strip()
+        """Get device serial number."""
+        return self._adb(["get-serialno"], timeout=5).stdout.strip()
     
     def has_root(self) -> bool:
+        """Check if we can get root via su."""
+        if self.shell.alive:
+            return True
+        return self.shell.connect()
+    
+    def ensure_shell(self) -> None:
+        """Ensure shell is connected, raise if not."""
+        if not self.shell.alive:
+            if not self.shell.connect():
+                raise RuntimeError("Cannot establish root shell")
+    
+    def close(self) -> None:
+        """Close shell session."""
+        self.shell.disconnect()
+    
+    # -------------------------------------------------------------------------
+    # File Operations (these use adb push/pull, not shell)
+    # -------------------------------------------------------------------------
+    
+    def push(self, local: Path, remote: str, timeout: int = 300) -> bool:
+        """Push file to device."""
         try:
-            r = self._run(["shell", "su", "-c", "id -u"], check=False, timeout=5)
-            return r.returncode == 0 and r.stdout.strip() == "0"
+            r = self._adb(["push", str(local), remote], timeout=timeout)
+            return r.returncode == 0
         except Exception:
             return False
     
-    # Shell commands
-    def sh(self, cmd: str, check: bool = True, timeout: Optional[int] = None) -> subprocess.CompletedProcess:
-        """Run shell command (no root)."""
-        return self._run(["shell", cmd], check=check, timeout=timeout)
-    
-    def su(self, cmd: str, check: bool = True, timeout: Optional[int] = None) -> subprocess.CompletedProcess:
-        """Run shell command as root."""
-        return self._run(["shell", "su", "-c", cmd], check=check, timeout=timeout)
-    
-    # File operations
-    def push(self, local: Path, remote: str, timeout: int = 300) -> bool:
+    def pull(self, remote: str, local: Path, timeout: int = 300) -> bool:
+        """Pull file from device."""
         try:
-            self._run(["push", str(local), remote], timeout=timeout)
-            return True
-        except subprocess.CalledProcessError:
+            r = self._adb(["pull", remote, str(local)], timeout=timeout)
+            return r.returncode == 0
+        except Exception:
             return False
     
-    def pull(self, remote: str, local: Path, timeout: int = 300) -> None:
-        self._run(["pull", remote, str(local)], timeout=timeout)
+    def write_file(self, path: str, content: str) -> None:
+        """Write content to device file (push temp file, then mv)."""
+        with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.tmp') as f:
+            f.write(content)
+            tmp_local = f.name
+        try:
+            tmp_remote = f"/data/local/tmp/.deploy_{os.getpid()}.tmp"
+            if not self.push(Path(tmp_local), tmp_remote):
+                raise RuntimeError("Failed to push temp file")
+            self.shell.run(f"mv {tmp_remote} {path}")
+        finally:
+            os.unlink(tmp_local)
+    
+    # -------------------------------------------------------------------------
+    # Convenience methods that delegate to shell
+    # -------------------------------------------------------------------------
     
     def exists(self, path: str, is_dir: bool = False) -> bool:
-        flag = "-d" if is_dir else "-f"
-        r = self.su(f"[ {flag} '{path}' ] && echo y || echo n", check=False)
-        return "y" in r.stdout
+        return self.shell.exists(path, is_dir)
     
     def mkdir(self, path: str) -> None:
-        self.su(f"mkdir -p '{path}'")
+        self.shell.mkdir(path)
     
     def rm(self, path: str) -> None:
-        self.su(f"rm -rf '{path}'", check=False)
-    
-    def write(self, path: str, content: str) -> None:
-        """Write content to device file via temp file."""
-        with tempfile.NamedTemporaryFile(mode='w', delete=False) as f:
-            f.write(content)
-            tmp = f.name
-        try:
-            tmp_remote = f"/data/local/tmp/.tmp_{os.getpid()}"
-            self.push(Path(tmp), tmp_remote)
-            self.su(f"mv '{tmp_remote}' '{path}'")
-        finally:
-            os.unlink(tmp)
-    
-    def read(self, path: str) -> str:
-        return self.su(f"cat '{path}'").stdout
-    
-    # Disk image operations
-    def create_image(self, path: str, size_mb: int) -> None:
-        log(f"Creating {size_mb}MB ext4 image...")
-        self.su(f"dd if=/dev/zero of='{path}' bs=1M count=0 seek={size_mb}", timeout=60)
-        self.su(f"mkfs.ext4 -F '{path}'", timeout=120)
-        log_ok(f"Image created: {path}")
-    
-    def mount(self, image: str, mountpoint: str) -> None:
-        self.mkdir(mountpoint)
-        self.su(f"mount -o loop,rw,suid,dev,exec '{image}' '{mountpoint}'")
-        log_ok(f"Mounted at {mountpoint} (suid enabled)")
-    
-    def umount(self, mountpoint: str) -> bool:
-        return self.su(f"umount '{mountpoint}'", check=False).returncode == 0
+        self.shell.rm(path)
     
     def is_mounted(self, path: str) -> bool:
-        return self.su(f"mountpoint -q '{path}'", check=False).returncode == 0
+        return self.shell.is_mounted(path)
+    
+    def mount(self, image: str, mountpoint: str) -> None:
+        self.shell.mount(image, mountpoint)
+    
+    def umount(self, path: str) -> bool:
+        return self.shell.umount(path)
+    
+    def create_image(self, path: str, size_mb: int) -> None:
+        self.shell.create_ext4_image(path, size_mb)
 
 
 # =============================================================================
-# LXC - Container management
+# LXC - Container management (uses DeviceShell)
 # =============================================================================
 
 class LXC:
-    """LXC container operations via ADB."""
+    """LXC container operations - all commands via persistent shell."""
     
     _NAME_RE = re.compile(r'^[a-zA-Z][a-zA-Z0-9_-]*$')
     
     def __init__(self, adb: ADB, cfg: Config):
         self.adb = adb
+        self.shell = adb.shell  # Direct shell access
         self.cfg = cfg
         self._container: Optional[str] = None
     
@@ -330,62 +513,86 @@ class LXC:
     
     def use(self, name: str) -> None:
         """Set default container for subsequent operations."""
+        if name is None:
+            raise ValueError("Container name cannot be None")
         self.validate_name(name)
         self._container = name
     
     def _env(self) -> str:
+        """LXC environment variables."""
         d = self.cfg.device
         return (f"LD_LIBRARY_PATH={d.lxc_prefix}/lib "
                 f"LXC_PATH={d.lxc_containers} "
-                f"XDG_RUNTIME_DIR={d.lxc_runtime} ")
+                f"XDG_RUNTIME_DIR={d.lxc_runtime}")
     
-    def _lxc(self, cmd: str, timeout: int = 60, check: bool = True) -> subprocess.CompletedProcess:
+    def _lxc_cmd(self, cmd: str) -> str:
+        """Build full LXC command with env and path."""
         if cmd.startswith("lxc-"):
             cmd = f"{self.cfg.device.lxc_prefix}/bin/{cmd}"
-        return self.adb.su(f"{self._env()}{cmd}", check=check, timeout=timeout)
+        return f"{self._env()} {cmd}"
+    
+    def _run(self, cmd: str, timeout: int = 60) -> tuple[str, int]:
+        """Run LXC command via shell."""
+        return self.shell.run(self._lxc_cmd(cmd), timeout=timeout, check=False)
+    
+    def _resolve_name(self, name: Optional[str]) -> str:
+        """Resolve container name."""
+        resolved = name or self._container
+        if resolved is None:
+            raise ValueError("No container name provided and no default set")
+        return resolved
     
     # Container lifecycle
     def start(self, name: Optional[str] = None) -> None:
-        name = name or self._container
-        self._lxc(f"lxc-start -n {name} -P {self.cfg.device.lxc_containers}", timeout=30)
+        name = self._resolve_name(name)
+        out, rc = self._run(f"lxc-start -n {name} -P {self.cfg.device.lxc_containers}", timeout=30)
+        if rc != 0:
+            raise RuntimeError(f"lxc-start failed: {out}")
     
     def stop(self, name: Optional[str] = None, kill: bool = False) -> None:
-        name = name or self._container
-        k = "-k" if kill else ""
-        self._lxc(f"lxc-stop -n {name} -P {self.cfg.device.lxc_containers} {k}", timeout=30)
+        name = self._resolve_name(name)
+        flag = "-k" if kill else ""
+        self._run(f"lxc-stop -n {name} -P {self.cfg.device.lxc_containers} {flag}", timeout=30)
     
     def running(self, name: Optional[str] = None) -> bool:
-        name = name or self._container
-        r = self._lxc(f"lxc-info -n {name} -s", timeout=10, check=False)
-        return "RUNNING" in r.stdout
+        name = self._resolve_name(name)
+        out, _ = self._run(f"lxc-info -n {name} -s", timeout=10)
+        return "RUNNING" in out
     
     def exists(self, name: Optional[str] = None) -> bool:
-        name = name or self._container
-        return self.adb.exists(self.cfg.device.container_path(name), is_dir=True)
+        name = self._resolve_name(name)
+        return self.shell.exists(self.cfg.device.container_path(name), is_dir=True)
     
     # Execute inside container
     def run(self, cmd: str, name: Optional[str] = None, 
-            timeout: int = 60, check: bool = True) -> subprocess.CompletedProcess:
-        name = name or self._container
-        # Use -e (elevated privileges) to bypass Android capability restrictions
-        return self._lxc(
-            f"lxc-attach -n {name} -P {self.cfg.device.lxc_containers} -e -- {cmd}",
-            timeout=timeout, check=check
-        )
+            timeout: int = 60, check: bool = True) -> tuple[str, int]:
+        """Run command inside container. Returns (output, returncode)."""
+        name = self._resolve_name(name)
+        full_cmd = f"lxc-attach -n {name} -P {self.cfg.device.lxc_containers} -e -- {cmd}"
+        out, rc = self._run(full_cmd, timeout=timeout)
+        if check and rc != 0:
+            raise RuntimeError(f"Container command failed (rc={rc}): {out[:200]}")
+        return out, rc
     
     def output(self, cmd: str, name: Optional[str] = None, timeout: int = 60) -> str:
-        return self.run(cmd, name, timeout, check=False).stdout.strip()
+        """Run command, return stdout."""
+        out, _ = self.run(cmd, name, timeout, check=False)
+        return out.strip()
     
     def ok(self, cmd: str, name: Optional[str] = None, timeout: int = 60) -> bool:
-        return self.run(cmd, name, timeout, check=False).returncode == 0
+        """Run command, return True if success."""
+        _, rc = self.run(cmd, name, timeout, check=False)
+        return rc == 0
     
     # File operations inside container
     def write(self, path: str, content: str, name: Optional[str] = None) -> None:
-        name = name or self._container
+        """Write file inside container via rootfs."""
+        name = self._resolve_name(name)
         rootfs = self.cfg.device.rootfs_path(name)
-        self.adb.write(f"{rootfs}{path}", content)
+        self.adb.write_file(f"{rootfs}{path}", content)
     
     def file_exists(self, path: str, name: Optional[str] = None) -> bool:
+        """Check if file exists inside container."""
         return self.ok(f"test -f {path}", name, timeout=10)
 
 
@@ -442,18 +649,29 @@ class Crypto:
     
     @staticmethod
     def parse_gentoo_digests(content: str, filename: str) -> Optional[str]:
-        """Extract SHA512 hash from Gentoo DIGESTS file."""
+        """Extract SHA512 hash from Gentoo DIGESTS file.
+        
+        The DIGESTS file format has sections like:
+        # SHA512 HASH
+        <hash> <filename>
+        
+        We need to find the hash for our specific filename in the SHA512 section.
+        """
         in_sha512 = False
         for line in content.split('\n'):
             line = line.strip()
             if 'SHA512' in line and 'HASH' in line:
                 in_sha512 = True
                 continue
-            if in_sha512 and line and not line.startswith('#'):
+            if in_sha512:
+                if line.startswith('#') or not line:
+                    # End of SHA512 section or comment - keep looking
+                    if line.startswith('#') and 'HASH' in line:
+                        in_sha512 = False  # New hash section started
+                    continue
                 parts = line.split()
                 if len(parts) >= 2 and filename in parts[-1]:
                     return parts[0].lower()
-                in_sha512 = False
         return None
 
 
@@ -474,6 +692,95 @@ class Deployer:
             ndk_path = cfg.repo_root / "_ndk" / "android-ndk-r27c"
             if ndk_path.exists():
                 os.environ["ANDROID_NDK_HOME"] = str(ndk_path)
+    
+    @property
+    def shell(self) -> DeviceShell:
+        """Direct access to device shell."""
+        return self.adb.shell
+    
+    def _detect_host_interface(self) -> str:
+        """Auto-detect the active network interface for NAT."""
+        if self.cfg.network.host_interface:
+            return self.cfg.network.host_interface
+        
+        # Try to find interface with default route
+        out, _ = self.shell.run("ip route show default 2>/dev/null | head -1", timeout=10)
+        if out.strip():
+            parts = out.strip().split()
+            if "dev" in parts:
+                idx = parts.index("dev")
+                if idx + 1 < len(parts):
+                    log(f"Auto-detected interface: {parts[idx + 1]}")
+                    return parts[idx + 1]
+        
+        # Fallback: check common interfaces
+        for iface in ["wlan0", "rmnet_data0", "eth0", "usb0", "rndis0"]:
+            out, rc = self.shell.run(f"ip link show {iface} 2>/dev/null", timeout=5)
+            if rc == 0 and "UP" in out:
+                log(f"Found active interface: {iface}")
+                return iface
+        
+        log_warn("Could not detect network interface, using wlan0")
+        return "wlan0"
+    
+    def _apply_kernelsu_selinux_rules(self) -> bool:
+        """Apply SELinux rules via KernelSU for LXC networking.
+        
+        TEAM_008: KernelSU provides ksud for runtime SELinux policy modification.
+        This grants the shell domain permissions to create bridge/veth interfaces.
+        
+        Returns True if rules were applied successfully.
+        """
+        log("Applying KernelSU SELinux rules for LXC networking...")
+        
+        # Check if ksud is available (KernelSU is working)
+        _, rc = self.shell.run("which ksud 2>/dev/null || test -x /data/adb/ksud", timeout=5)
+        if rc != 0:
+            log_warn("ksud not found - KernelSU may not be installed or working")
+            log_warn("Trying to continue anyway (may fail if SELinux is enforcing)")
+            return False
+        
+        # SELinux rules needed for LXC bridge networking
+        # Reference: KERNEL_REQUIREMENTS.md
+        rules = [
+            # Allow shell to manage network interfaces (bridge, veth)
+            'allow shell self netlink_route_socket "create bind read write nlmsg_read nlmsg_write getattr setattr"',
+            # Allow shell to query network state (ss, netstat)
+            'allow shell self netlink_tcpdiag_socket "create bind read write nlmsg_read"',
+            # Allow shell to create TUN/TAP devices
+            'allow shell self tun_socket "create read write ioctl"',
+            # Allow shell network admin capabilities
+            'allow shell self capability "net_admin net_raw"',
+            'allow shell self capability2 "syslog"',
+            # Allow shell to use netfilter (iptables)
+            'allow shell self netlink_netfilter_socket "create bind read write nlmsg_read nlmsg_write"',
+            # Allow shell to manage network devices
+            'allow shell device chr_file "read write ioctl open"',
+            # Allow shell to access /dev/net/tun
+            'allow shell tun_device chr_file "read write ioctl open"',
+            # Allow shell to set sysctls (ip_forward)
+            'allow shell proc_net sysctl_net_type "read write"',
+            'allow shell self netlink_kobject_uevent_socket "create bind read write"',
+        ]
+        
+        applied = 0
+        for rule in rules:
+            # Use ksud sepolicy to apply the rule
+            _, rc = self.shell.run(f'ksud sepolicy {rule}', timeout=10, check=False)
+            if rc == 0:
+                applied += 1
+            else:
+                # Try alternative path
+                _, rc = self.shell.run(f'/data/adb/ksud sepolicy {rule}', timeout=10, check=False)
+                if rc == 0:
+                    applied += 1
+        
+        if applied > 0:
+            log_ok(f"Applied {applied}/{len(rules)} SELinux rules via KernelSU")
+            return True
+        else:
+            log_warn("Could not apply SELinux rules - bridge networking may fail")
+            return False
     
     # -------------------------------------------------------------------------
     # Step 1: Build LXC
@@ -587,7 +894,8 @@ class Deployer:
             log_ok("LXC binaries already on device")
         else:
             log("Pushing LXC binaries...")
-            self.adb.sh(f"mkdir -p '{self.cfg.device.lxc_prefix}'", check=False)
+            # Create directory via adb shell (no root needed for /data/local/tmp)
+            self.adb._adb(["shell", "mkdir", "-p", self.cfg.device.lxc_prefix])
             
             for subdir in ["bin", "lib", "libexec", "etc", "share"]:
                 src = self.cfg.build_output / subdir
@@ -630,11 +938,14 @@ class Deployer:
         container = self.cfg.container_name
         config_path = f"{d.container_path(container)}/config"
         
+        # Ensure shell is connected
+        self.adb.ensure_shell()
+        
         # Check if already configured
-        if self.adb.exists(config_path):
-            r = self.adb.su(f"LD_LIBRARY_PATH={d.lxc_prefix}/lib {d.lxc_prefix}/bin/lxc-start --version", check=False)
-            if r.returncode == 0:
-                log_ok(f"Already configured (lxc-start {r.stdout.strip()})")
+        if self.shell.exists(config_path):
+            out, rc = self.shell.run(f"LD_LIBRARY_PATH={d.lxc_prefix}/lib {d.lxc_prefix}/bin/lxc-start --version")
+            if rc == 0:
+                log_ok(f"Already configured (lxc-start {out.strip()})")
                 return
         
         # Create directories
@@ -643,42 +954,60 @@ class Deployer:
                      f"{d.lxc_prefix}/etc/lxc",
                      d.container_path(container),
                      d.rootfs_path(container)]:
-            self.adb.mkdir(path)
+            self.shell.mkdir(path)
         log_ok("Directories created")
         
         # Set permissions
         log("Setting permissions...")
-        self.adb.su(f"chmod 755 {d.lxc_prefix}/bin/* 2>/dev/null || true")
-        self.adb.su(f"chmod 755 {d.lxc_prefix}/libexec/lxc/* 2>/dev/null || true")
-        self.adb.su(f"chmod 644 {d.lxc_prefix}/lib/*.so* 2>/dev/null || true")
+        self.shell.run(f"chmod 755 {d.lxc_prefix}/bin/* 2>/dev/null || true")
+        self.shell.run(f"chmod 755 {d.lxc_prefix}/libexec/lxc/* 2>/dev/null || true")
+        self.shell.run(f"chmod 644 {d.lxc_prefix}/lib/*.so* 2>/dev/null || true")
         log_ok("Permissions set")
         
         # Write LXC configs
         log("Writing LXC configuration...")
-        self.adb.write(f"{d.lxc_prefix}/etc/lxc/default.conf", "lxc.net.0.type = none\n")
-        self.adb.write(f"{d.lxc_prefix}/etc/lxc/lxc.conf", f"lxc.lxcpath = {d.lxc_containers}\n")
+        self.adb.write_file(f"{d.lxc_prefix}/etc/lxc/default.conf", "lxc.net.0.type = none\n")
+        self.adb.write_file(f"{d.lxc_prefix}/etc/lxc/lxc.conf", f"lxc.lxcpath = {d.lxc_containers}\n")
         
-        # Setup bridge network
-        self._setup_bridge_network()
+        # TEAM_008: Apply KernelSU SELinux rules BEFORE network setup
+        # This grants shell the permissions needed for bridge/veth/macvlan creation
+        self._apply_kernelsu_selinux_rules()
+        
+        # Setup network (macvlan or bridge based on config)
+        self._setup_network()
         
         # Write container config
         # NOTE: lxc.cap.drop = (empty) disables capability dropping which fails on Android
         net = self.cfg.network
         res = self.cfg.resources
+        
+        # TEAM_008: Generate network config based on mode
+        if net.mode == "macvlan":
+            host_iface = self._detect_host_interface()
+            network_config = f"""# Macvlan networking - container gets REAL IP on home network
+# Direct SSH access: ssh {self.cfg.container_user}@{net.container_ip}
+lxc.net.0.type = macvlan
+lxc.net.0.macvlan.mode = bridge
+lxc.net.0.link = {host_iface}
+lxc.net.0.flags = up
+lxc.net.0.ipv4.address = {net.container_ip}/{net.container_netmask}
+lxc.net.0.ipv4.gateway = {net.container_gateway}"""
+        else:
+            network_config = f"""# Bridge networking - internal NAT network
+# Requires port forwarding for external access
+lxc.net.0.type = veth
+lxc.net.0.link = {net.bridge}
+lxc.net.0.flags = up
+lxc.net.0.ipv4.address = {net.bridge_container_ip}/24
+lxc.net.0.ipv4.gateway = {net.bridge_gateway}"""
+        
         container_config = f"""# Gentoo LXC container configuration
 # PRIORITY: Gentoo > Android - container gets majority of system resources
 lxc.uts.name = {container}
 lxc.arch = aarch64
 lxc.rootfs.path = dir:{d.rootfs_path(container)}
 
-# Bridge networking - container gets its own IP address
-# Requires kernel with CONFIG_BRIDGE=y, CONFIG_VETH=y (verified supported)
-# Also requires SELinux permissive mode (set via kernel boot param enforcing=0)
-lxc.net.0.type = veth
-lxc.net.0.link = {net.bridge}
-lxc.net.0.flags = up
-lxc.net.0.ipv4.address = {net.container_ip}/24
-lxc.net.0.ipv4.gateway = {net.gateway}
+{network_config}
 
 # =============================================================================
 # RESOURCE ALLOCATION: Gentoo > Android
@@ -731,54 +1060,110 @@ lxc.environment = LANG=en_US.UTF-8
 # Android-specific: disable capability dropping (fails on Android kernel)
 lxc.cap.drop =
 """
-        self.adb.write(config_path, container_config)
+        self.adb.write_file(config_path, container_config)
         log_ok("Container config written")
         
-        # Fix LXC common.conf for Android compatibility
-        # Disable seccomp (not supported) and cap.drop (fails on Android)
+        # Patch LXC common.conf for Android compatibility
         log("Patching LXC config for Android compatibility...")
         common_conf = f"{d.lxc_prefix}/share/lxc/config/common.conf"
-        self.adb.su(f"sed -i 's/^lxc.seccomp.profile/#lxc.seccomp.profile/' '{common_conf}' 2>/dev/null || true")
-        self.adb.su(f"sed -i 's/^lxc.cap.drop/#lxc.cap.drop/' '{common_conf}' 2>/dev/null || true")
+        self.shell.run(f"sed -i 's/^lxc.seccomp.profile/#lxc.seccomp.profile/' {common_conf} 2>/dev/null || true")
+        self.shell.run(f"sed -i 's/^lxc.cap.drop/#lxc.cap.drop/' {common_conf} 2>/dev/null || true")
         log_ok("LXC config patched for Android")
         
         # Smoke test
-        r = self.adb.su(f"LD_LIBRARY_PATH={d.lxc_prefix}/lib {d.lxc_prefix}/bin/lxc-start --version")
-        log_ok(f"lxc-start version: {r.stdout.strip()}")
+        out, _ = self.shell.run(f"LD_LIBRARY_PATH={d.lxc_prefix}/lib {d.lxc_prefix}/bin/lxc-start --version")
+        log_ok(f"lxc-start version: {out.strip()}")
     
-    def _setup_bridge_network(self) -> None:
-        """Setup bridge networking with NAT."""
+    def _setup_network(self) -> None:
+        """Setup container networking based on mode.
+        
+        TEAM_008: Two modes supported:
+        - 'bridge': Internal NAT network (10.0.3.x) - requires port forwarding
+        - 'macvlan': Real IP on home network (192.168.178.x) - direct SSH access
+        """
+        net = self.cfg.network
+        host_iface = self._detect_host_interface()
+        
+        if net.mode == "macvlan":
+            self._setup_macvlan_network(host_iface)
+        else:
+            self._setup_bridge_network(host_iface)
+    
+    def _setup_macvlan_network(self, host_iface: str) -> None:
+        """Setup macvlan networking - container gets real IP on LAN.
+        
+        TEAM_008: This allows direct SSH access via `ssh vince@192.168.178.100`
+        Container appears as a separate device on your home network.
+        """
+        net = self.cfg.network
+        macvlan_name = "lxc-macvlan"
+        
+        log(f"Setting up macvlan network on {host_iface}...")
+        log(f"Container will get IP: {net.container_ip}")
+        
+        # Enable IP forwarding (still needed for some scenarios)
+        self.shell.run("sysctl -w net.ipv4.ip_forward=1")
+        
+        # Check if macvlan already exists
+        _, rc = self.shell.run(f"ip link show {macvlan_name} 2>/dev/null")
+        if rc == 0:
+            log(f"Macvlan {macvlan_name} already exists")
+        else:
+            # Create macvlan interface in bridge mode
+            # This allows container to communicate with LAN devices
+            log(f"Creating macvlan {macvlan_name} on {host_iface}...")
+            out, rc = self.shell.run(
+                f"ip link add {macvlan_name} link {host_iface} type macvlan mode bridge",
+                check=False
+            )
+            if rc != 0:
+                log_warn(f"Failed to create macvlan: {out}")
+                log_warn("Falling back to bridge mode")
+                self._setup_bridge_network(host_iface)
+                return
+            
+            self.shell.run(f"ip link set {macvlan_name} up")
+            log_ok(f"Macvlan created: {macvlan_name}")
+        
+        # Note: The actual IP is assigned by LXC in the container config
+        log_ok(f"Macvlan network ready - container will use {net.container_ip}")
+    
+    def _setup_bridge_network(self, host_iface: str) -> None:
+        """Setup bridge networking with NAT (fallback mode)."""
         net = self.cfg.network
         
         # Check if bridge exists
-        r = self.adb.su(f"ip link show {net.bridge} 2>/dev/null", check=False)
-        if r.returncode == 0:
+        _, rc = self.shell.run(f"ip link show {net.bridge} 2>/dev/null")
+        if rc == 0:
             log(f"Bridge {net.bridge} already exists")
         else:
             log(f"Creating bridge {net.bridge}...")
-            self.adb.su(f"ip link add name {net.bridge} type bridge")
-            self.adb.su(f"ip addr add {net.gateway}/24 dev {net.bridge}")
-            self.adb.su(f"ip link set {net.bridge} up")
-            log_ok(f"Bridge created: {net.gateway}")
+            self.shell.run(f"ip link add name {net.bridge} type bridge")
+            self.shell.run(f"ip addr add {net.bridge_gateway}/24 dev {net.bridge}")
+            self.shell.run(f"ip link set {net.bridge} up")
+            log_ok(f"Bridge created: {net.bridge_gateway}")
         
         # Enable IP forwarding
-        self.adb.su("sysctl -w net.ipv4.ip_forward=1")
+        self.shell.run("sysctl -w net.ipv4.ip_forward=1")
         log_ok("IP forwarding enabled")
         
         # NAT rules
-        nat = f"-s {net.subnet} -o {net.host_interface} -j MASQUERADE"
-        if self.adb.su(f"iptables -t nat -C POSTROUTING {nat} 2>/dev/null", check=False).returncode != 0:
-            self.adb.su(f"iptables -t nat -A POSTROUTING {nat}")
-            log_ok("NAT rule added")
+        nat = f"-s {net.bridge_subnet} -o {host_iface} -j MASQUERADE"
+        _, rc = self.shell.run(f"iptables -t nat -C POSTROUTING {nat} 2>/dev/null")
+        if rc != 0:
+            self.shell.run(f"iptables -t nat -A POSTROUTING {nat}")
+            log_ok(f"NAT rule added for {host_iface}")
         
         # Forward rules
-        fwd_out = f"-i {net.bridge} -o {net.host_interface} -j ACCEPT"
-        if self.adb.su(f"iptables -C FORWARD {fwd_out} 2>/dev/null", check=False).returncode != 0:
-            self.adb.su(f"iptables -A FORWARD {fwd_out}")
+        fwd_out = f"-i {net.bridge} -o {host_iface} -j ACCEPT"
+        _, rc = self.shell.run(f"iptables -C FORWARD {fwd_out} 2>/dev/null")
+        if rc != 0:
+            self.shell.run(f"iptables -A FORWARD {fwd_out}")
         
-        fwd_in = f"-i {net.host_interface} -o {net.bridge} -m state --state RELATED,ESTABLISHED -j ACCEPT"
-        if self.adb.su(f"iptables -C FORWARD {fwd_in} 2>/dev/null", check=False).returncode != 0:
-            self.adb.su(f"iptables -A FORWARD {fwd_in}")
+        fwd_in = f"-i {host_iface} -o {net.bridge} -m state --state RELATED,ESTABLISHED -j ACCEPT"
+        _, rc = self.shell.run(f"iptables -C FORWARD {fwd_in} 2>/dev/null")
+        if rc != 0:
+            self.shell.run(f"iptables -A FORWARD {fwd_in}")
         
         log_ok("Bridge network ready")
     
@@ -792,57 +1177,55 @@ lxc.cap.drop =
         rootfs = d.rootfs_path(self.cfg.container_name)
         tarball = f"{d.tmp}/{self.cfg.gentoo.filename}"
         
-        if not self.adb.exists(tarball):
+        if not self.shell.exists(tarball):
             die(f"Stage3 not found: {tarball}")
         
         # Check if already unpacked
-        if self.adb.is_mounted(rootfs) and self.adb.exists(f"{rootfs}/bin/bash"):
+        if self.shell.is_mounted(rootfs) and self.shell.exists(f"{rootfs}/bin/bash"):
             log_ok("Rootfs already unpacked")
             return
         
         # Create/mount disk image (for suid support)
-        if not self.adb.exists(d.rootfs_image):
-            self.adb.create_image(d.rootfs_image, self.cfg.rootfs_image_size_mb)
+        if not self.shell.exists(d.rootfs_image):
+            self.shell.create_ext4_image(d.rootfs_image, self.cfg.rootfs_image_size_mb)
         else:
             log(f"Using existing image: {d.rootfs_image}")
         
-        if not self.adb.is_mounted(rootfs):
-            self.adb.mount(d.rootfs_image, rootfs)
+        if not self.shell.is_mounted(rootfs):
+            self.shell.mount(d.rootfs_image, rootfs)
         
         # Unpack stage3
-        if not self.adb.exists(f"{rootfs}/bin/bash"):
+        if not self.shell.exists(f"{rootfs}/bin/bash"):
             log("Unpacking stage3 (this takes several minutes)...")
             with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"), console=console) as p:
                 p.add_task("Extracting...", total=None)
-                # Android's tar doesn't support xz or --preserve-permissions
-                # Use tar -xJf which works on some devices, or fallback to busybox
-                result = self.adb.su(
-                    f"cd '{rootfs}' && tar -xJf '{tarball}' 2>/dev/null || "
-                    f"busybox tar -xJf '{tarball}' 2>/dev/null || "
-                    f"toybox tar -xf '{tarball}'",
-                    timeout=600,
-                    check=False
+                # Try various tar implementations
+                self.shell.run(
+                    f"cd {rootfs} && tar -xJf {tarball} 2>/dev/null || "
+                    f"busybox tar -xJf {tarball} 2>/dev/null || "
+                    f"toybox tar -xf {tarball}",
+                    timeout=600
                 )
-                # If all tar methods fail, try extracting on host and pushing
-                if not self.adb.exists(f"{rootfs}/bin/bash"):
+                # If all tar methods fail, try extracting on host
+                if not self.shell.exists(f"{rootfs}/bin/bash"):
                     log_warn("Device tar failed, trying host extraction...")
                     self._extract_on_host_and_push(tarball, rootfs)
             
-            if not self.adb.exists(f"{rootfs}/bin/bash"):
+            if not self.shell.exists(f"{rootfs}/bin/bash"):
                 die("Unpack failed: /bin/bash not found")
             log_ok("Stage3 unpacked")
         
         # Essential directories
         for d_name in ["dev", "proc", "sys", "run", "tmp"]:
-            self.adb.su(f"mkdir -p '{rootfs}/{d_name}'")
+            self.shell.mkdir(f"{rootfs}/{d_name}")
         
-        # Fix /var/empty ownership for sshd (must be owned by root, not world-writable)
-        self.adb.su(f"mkdir -p '{rootfs}/var/empty'")
-        self.adb.su(f"chown 0:0 '{rootfs}/var/empty' 2>/dev/null || true")
-        self.adb.su(f"chmod 755 '{rootfs}/var/empty'")
+        # Fix /var/empty ownership for sshd
+        self.shell.run(f"mkdir -p {rootfs}/var/empty")
+        self.shell.run(f"chown 0:0 {rootfs}/var/empty 2>/dev/null || true")
+        self.shell.run(f"chmod 755 {rootfs}/var/empty")
         
         # DNS
-        self.adb.write(f"{rootfs}/etc/resolv.conf", "nameserver 8.8.8.8\n")
+        self.adb.write_file(f"{rootfs}/etc/resolv.conf", "nameserver 8.8.8.8\n")
         log_ok("DNS configured")
         
         # Portage make.conf - Optimized for Pixel 6 (Google Tensor G1 / Samsung Exynos)
@@ -883,21 +1266,21 @@ FEATURES="-sandbox -usersandbox -pid-sandbox -network-sandbox parallel-fetch"
 LINGUAS="en"
 L10N="en"
 """
-        self.adb.write(f"{rootfs}/etc/portage/make.conf", make_conf)
+        self.adb.write_file(f"{rootfs}/etc/portage/make.conf", make_conf)
         log_ok("Portage configured")
         
         # OpenRC for container (idempotent - check before appending)
-        rc_check = self.adb.su(f"grep -q 'rc_sys=\"lxc\"' '{rootfs}/etc/rc.conf'", check=False)
-        if rc_check.returncode != 0:
-            rc_conf = '\nrc_sys="lxc"\nrc_controller_cgroups="NO"\nrc_depend_strict="NO"\n'
-            self.adb.su(f"echo '{rc_conf}' >> '{rootfs}/etc/rc.conf'", check=False)
+        _, rc = self.shell.run(f'grep -q \'rc_sys="lxc"\' {rootfs}/etc/rc.conf')
+        if rc != 0:
+            rc_conf = 'rc_sys="lxc"\nrc_controller_cgroups="NO"\nrc_depend_strict="NO"'
+            self.shell.run(f"echo -e '\n{rc_conf}' >> {rootfs}/etc/rc.conf")
         log_ok("OpenRC configured")
         
         # Copy doas source to rootfs for building in step 6
         doas_file = "opendoas-6.8.2.tar.xz"
         doas_remote = f"{d.tmp}/{doas_file}"
-        if self.adb.exists(doas_remote):
-            self.adb.su(f"cp '{doas_remote}' '{rootfs}/root/{doas_file}'")
+        if self.shell.exists(doas_remote):
+            self.shell.run(f"cp {doas_remote} {rootfs}/root/{doas_file}")
             log_ok("Doas source copied to rootfs")
     
     # -------------------------------------------------------------------------
@@ -911,18 +1294,17 @@ L10N="en"
         rootfs = self.cfg.device.rootfs_path(container)
         
         # Ensure mounted
-        if not self.adb.is_mounted(rootfs):
-            if self.adb.exists(self.cfg.device.rootfs_image):
-                self.adb.mount(self.cfg.device.rootfs_image, rootfs)
+        if not self.shell.is_mounted(rootfs):
+            if self.shell.exists(self.cfg.device.rootfs_image):
+                self.shell.mount(self.cfg.device.rootfs_image, rootfs)
             else:
                 die("Rootfs not mounted - run step 5 first")
         
         # Ensure LXC runtime directory has correct permissions
-        # This is needed for lxc-attach to work properly on Android
         d = self.cfg.device
-        self.adb.su(f"rm -rf '{d.lxc_runtime}' 2>/dev/null || true")
-        self.adb.su(f"mkdir -p '{d.lxc_runtime}/lxc/lock'")
-        self.adb.su(f"chmod -R 1777 '{d.lxc_runtime}'")
+        self.shell.run(f"rm -rf {d.lxc_runtime} 2>/dev/null || true")
+        self.shell.run(f"mkdir -p {d.lxc_runtime}/lxc/lock")
+        self.shell.run(f"chmod -R 1777 {d.lxc_runtime}")
         
         # Start container
         log("Starting container...")
@@ -934,7 +1316,7 @@ L10N="en"
         while time.time() < deadline:
             if self.lxc.running(container) and self.lxc.ok("true", container, timeout=5):
                 break
-            time.sleep(0.5)
+            time.sleep(self.cfg.container_ready_poll_interval)
         else:
             die("Container failed to start")
         
@@ -966,36 +1348,43 @@ L10N="en"
         
         # Create user
         if not self.lxc.output(f"id {user} 2>/dev/null"):
-            self.lxc.run(f"useradd -m -G wheel -s /bin/bash {user}")
+            self.lxc.run(f"useradd -m -G wheel -s /bin/bash {user}", timeout=self.cfg.timeout_short)
             log_ok(f"User {user} created")
         else:
             log(f"User {user} exists")
         
         # Ensure wheel group
         if "wheel" not in self.lxc.output(f"groups {user}"):
-            self.lxc.run(f"usermod -aG wheel {user}")
+            self.lxc.run(f"usermod -aG wheel {user}", timeout=self.cfg.timeout_short)
         
         # Unlock account for SSH key auth
         shadow = self.lxc.output(f"grep '^{user}:' /etc/shadow")
         if f"{user}:!" in shadow or f"{user}:*" in shadow:
-            self.lxc.run(f"passwd -d {user}")
+            self.lxc.run(f"passwd -d {user}", timeout=self.cfg.timeout_short)
             log("Account unlocked for SSH key auth")
         
         # Configure doas (already done in _install_doas, but ensure config exists)
         if not self.lxc.ok("test -f /etc/doas.conf", timeout=10):
             self.lxc.write("/etc/doas.conf", "permit nopass :wheel\n")
-            self.lxc.run("chmod 600 /etc/doas.conf")
+            self.lxc.run("chmod 600 /etc/doas.conf", timeout=self.cfg.timeout_short)
         log_ok("Doas configured")
         
-        # Configure SSH
-        sshd_config = """Port 22
+        # Configure SSH - detect SFTP server path (varies by Gentoo profile)
+        sftp_path = "/usr/lib64/misc/sftp-server"  # Default for 64-bit Gentoo
+        for candidate in ["/usr/lib64/misc/sftp-server", "/usr/lib/misc/sftp-server", 
+                          "/usr/libexec/sftp-server", "/usr/lib/ssh/sftp-server"]:
+            if self.lxc.ok(f"test -x {candidate}", timeout=5):
+                sftp_path = candidate
+                break
+        
+        sshd_config = f"""Port 22
 PermitRootLogin no
 PubkeyAuthentication yes
 AuthorizedKeysFile /home/%u/.ssh/authorized_keys
 PasswordAuthentication yes
 ChallengeResponseAuthentication no
 StrictModes no
-Subsystem sftp /usr/lib64/misc/sftp-server
+Subsystem sftp {sftp_path}
 """
         self.lxc.write("/etc/ssh/sshd_config", sshd_config)
         
@@ -1003,12 +1392,14 @@ Subsystem sftp /usr/lib64/misc/sftp-server
         ssh_key = self._get_ssh_pubkey()
         if ssh_key:
             home = f"/home/{user}"
-            self.lxc.run(f"mkdir -p {home}/.ssh")
-            self.lxc.run(f"chmod 700 {home}/.ssh")
+            self.lxc.run(f"mkdir -p {home}/.ssh", timeout=self.cfg.timeout_short)
+            self.lxc.run(f"chmod 700 {home}/.ssh", timeout=self.cfg.timeout_short)
             self.lxc.write(f"{home}/.ssh/authorized_keys", ssh_key + "\n")
-            self.lxc.run(f"chmod 600 {home}/.ssh/authorized_keys")
-            self.lxc.run(f"chown -R {user}:{user} {home}/.ssh")
-            self.lxc.run(f"chmod 755 {home}")
+            self.lxc.run(f"chmod 600 {home}/.ssh/authorized_keys", timeout=self.cfg.timeout_short)
+            self.lxc.run(f"chown -R {user}:{user} {home}/.ssh", timeout=self.cfg.timeout_short)
+            # Fix home directory ownership and permissions (like deploy_original.py)
+            self.lxc.run(f"chmod 755 {home}", timeout=self.cfg.timeout_short)
+            self.lxc.run(f"chown {user}:{user} {home}", timeout=self.cfg.timeout_short)
             log_ok("SSH key installed")
         else:
             log_warn("No SSH key found - password auth only")
@@ -1019,34 +1410,110 @@ Subsystem sftp /usr/lib64/misc/sftp-server
             log_ok("SSH host keys generated")
         
         # Start sshd (try both common paths)
-        self.lxc.run("pkill sshd 2>/dev/null || true", check=False)
-        sshd_started = self.lxc.run("/usr/sbin/sshd 2>/dev/null || /usr/bin/sshd", check=False, timeout=10)
-        if sshd_started.returncode == 0:
-            self.lxc.run("rc-update add sshd default 2>/dev/null || true", check=False)
+        self.lxc.run("pkill sshd 2>/dev/null || true", check=False, timeout=self.cfg.timeout_short)
+        _, rc = self.lxc.run("/usr/sbin/sshd 2>/dev/null || /usr/bin/sshd", check=False, timeout=10)
+        if rc == 0:
+            self.lxc.run("rc-update add sshd default 2>/dev/null || true", check=False, timeout=self.cfg.timeout_short)
             log_ok("SSH daemon started")
         else:
-            log_warn(f"Failed to start sshd: {sshd_started.stderr[:100] if sshd_started.stderr else 'unknown error'}")
+            log_warn("Failed to start sshd")
         
-        # Verify doas
+        # Verify doas and create sudo alias
         if self.lxc.ok("test -x /usr/bin/doas", timeout=10):
             log_ok("Doas verified")
+            # Create sudo alias so users can type 'sudo' and get doas
+            if not self.lxc.ok("test -x /usr/bin/sudo", timeout=5):
+                self.lxc.run("ln -sf /usr/bin/doas /usr/bin/sudo", timeout=self.cfg.timeout_short)
+                log_ok("sudo -> doas symlink created")
         
-        # Summary - container has its own IP via bridge networking
-        container_ip = self.cfg.network.container_ip
+        # Setup port forwarding (host:2222 -> container:22)
+        log("Setting up port forwarding...")
+        self._setup_port_forward(user)
         
+        # =================================================================
+        # VERIFICATION GATE - Fail loudly if anything is broken
+        # =================================================================
+        log("Verifying deployment...")
+        errors = []
+        
+        # 1. Container must be running
+        if not self.lxc.running(container):
+            errors.append("Container is NOT running")
+        
+        # 2. SSH must be listening on port 22
+        if not self.lxc.ok("netstat -tln 2>/dev/null | grep -q ':22 ' || ss -tln | grep -q ':22 '", timeout=10):
+            errors.append("SSH is NOT listening on port 22")
+        
+        # 3. User must exist
+        if not self.lxc.ok(f"id {user}", timeout=10):
+            errors.append(f"User '{user}' does NOT exist")
+        
+        # 4. doas/sudo must work
+        if not self.lxc.ok("test -x /usr/bin/doas || test -x /usr/bin/sudo", timeout=10):
+            errors.append("Neither doas nor sudo is installed")
+        
+        # 5. Container must be reachable (SECURITY CRITICAL)
+        # TEAM_008: Handle both macvlan and bridge modes
+        net = self.cfg.network
+        container_ip = net.container_ip
+        
+        if net.mode == "macvlan":
+            # Macvlan: ping directly (container has real LAN IP)
+            if not self.shell.run_ok(f"ping -c 1 -W 3 {container_ip} 2>/dev/null"):
+                errors.append(f"Container IP {container_ip} is NOT reachable via macvlan")
+                errors.append("SELinux may be blocking macvlan - check `dmesg | grep avc`")
+        else:
+            # Bridge: ping via bridge interface
+            if not self.shell.run_ok(f"ping -c 1 -W 2 -I {net.bridge} {net.bridge_container_ip} 2>/dev/null"):
+                errors.append(f"Container IP {net.bridge_container_ip} is NOT reachable - bridge networking may not be configured!")
+                errors.append("Run: python3 deploy.py --network to setup bridge")
+        
+        # 6. Port forward only needed for bridge mode
+        if net.mode != "macvlan":
+            result = self.adb._adb(["forward", "--list"], timeout=5)
+            if "tcp:2222" not in result.stdout:
+                errors.append("Port forward tcp:2222 is NOT set up")
+        
+        if errors:
+            console.print()
+            console.print(Panel.fit(
+                "[bold red]DEPLOYMENT VERIFICATION FAILED[/bold red]\n\n" +
+                "\n".join(f"✗ {e}" for e in errors),
+                title="✗ ERRORS",
+                border_style="red"
+            ))
+            die(f"Verification failed: {len(errors)} error(s)")
+        
+        log_ok("All verification checks passed")
+        
+        # TEAM_008: Generate connection info based on network mode
+        if net.mode == "macvlan":
+            connect_info = f"""[bold]Connect from ANY device on your network:[/bold]
+  ssh {user}@{container_ip}
+
+[bold]The container has a REAL IP on your home network![/bold]
+  No port forwarding needed - direct access from any device."""
+        else:
+            connect_info = f"""[bold]Connect from computer (via adb forward):[/bold]
+  ssh -p 2222 {user}@localhost
+
+[bold]Connect from Android:[/bold]
+  ssh {user}@{net.bridge_container_ip}"""
+        
+        # Summary
         console.print()
         console.print(Panel.fit(
             f"[bold green]Deployment Complete[/bold green]\n\n"
             f"[bold]Distribution:[/bold] Gentoo Linux (glibc, OpenRC)\n"
             f"[bold]User:[/bold] {user}\n"
             f"[bold]Container IP:[/bold] {container_ip}\n"
+            f"[bold]Network Mode:[/bold] {net.mode}\n"
             f"[bold]Rootfs Size:[/bold] {self.cfg.rootfs_image_size_mb // 1024}GB\n"
             f"[bold]Password:[/bold] (not set)\n\n"
-            f"[bold]Connect:[/bold] ssh {user}@{container_ip}\n\n"
+            f"{connect_info}\n\n"
             f"[dim]Inside Gentoo:[/dim]\n"
             f"  passwd                   # Set password\n"
-            f"  doas whoami              # Test privilege escalation\n"
-            f"  sudo whoami              # (alias for doas)",
+            f"  doas whoami              # Test privilege escalation",
             title="✓ Success",
             border_style="green"
         ))
@@ -1058,6 +1525,32 @@ Subsystem sftp /usr/lib64/misc/sftp-server
             if path.exists():
                 return path.read_text().strip()
         return None
+    
+    def _setup_port_forward(self, user: str) -> None:
+        """Setup port forwarding: host:2222 -> container:22 via bridge network.
+        
+        TEAM_004: adb forward can't forward to arbitrary IPs, only localhost.
+        We use iptables DNAT on the device to redirect traffic from port 2222
+        to the container's IP, then adb forward to port 2222.
+        """
+        container_ip = self.cfg.network.container_ip
+        
+        # Setup iptables DNAT rules on device to redirect port 2222 -> container:22
+        # Remove any existing rules first
+        self.shell.run(f"iptables -t nat -D PREROUTING -p tcp --dport 2222 -j DNAT --to-destination {container_ip}:22 2>/dev/null || true")
+        self.shell.run(f"iptables -t nat -D OUTPUT -p tcp --dport 2222 -j DNAT --to-destination {container_ip}:22 2>/dev/null || true")
+        
+        # Add DNAT rules
+        self.shell.run(f"iptables -t nat -A PREROUTING -p tcp --dport 2222 -j DNAT --to-destination {container_ip}:22")
+        self.shell.run(f"iptables -t nat -A OUTPUT -p tcp --dport 2222 -j DNAT --to-destination {container_ip}:22")
+        
+        # Enable IP forwarding
+        self.shell.run("echo 1 > /proc/sys/net/ipv4/ip_forward")
+        
+        # Setup adb forward to port 2222 on device (which gets DNAT'd to container)
+        self.adb._adb(["forward", "--remove", "tcp:2222"], timeout=5)
+        self.adb._adb(["forward", "tcp:2222", "tcp:2222"], timeout=10)
+        log_ok(f"Port forwarding: localhost:2222 -> {container_ip}:22 (via iptables DNAT)")
     
     def _install_doas(self) -> None:
         """Build and install OpenDoas from source."""
@@ -1099,51 +1592,38 @@ ln -sf /usr/bin/doas /usr/bin/sudo
             log_warn(f"doas build failed: {result.stderr[:100] if result.stderr else 'unknown error'}")
     
     def _apply_resource_priority(self) -> None:
-        """Apply resource priority: Gentoo > Android.
-        
-        This throttles Android userspace and boosts Gentoo container priority.
-        The kernel is already LXC-optimized; this reinforces resource allocation.
-        """
+        """Apply resource priority: Gentoo > Android."""
         res = self.cfg.resources
         container = self.cfg.container_name
-        
-        # Get container's cgroup path
-        # On Android, cgroups are typically at /dev/cgroup or /sys/fs/cgroup
         cgroup_base = "/sys/fs/cgroup"
-        
-        # Try to find the container's cgroup
         container_cgroup = f"/lxc/{container}"
         
-        # Apply CPU priority via cgroups (if cgroup v1)
-        self.adb.su(f"echo {res.cpu_shares} > {cgroup_base}/cpu{container_cgroup}/cpu.shares 2>/dev/null || true")
+        # Apply CPU priority via cgroups (with timeouts to avoid hangs)
+        self.shell.run(f"echo {res.cpu_shares} > {cgroup_base}/cpu{container_cgroup}/cpu.shares 2>/dev/null || true", timeout=10)
         
         # Apply memory soft limit
         mem_bytes = res.memory_limit_mb * 1024 * 1024
-        self.adb.su(f"echo {mem_bytes} > {cgroup_base}/memory{container_cgroup}/memory.soft_limit_in_bytes 2>/dev/null || true")
+        self.shell.run(f"echo {mem_bytes} > {cgroup_base}/memory{container_cgroup}/memory.soft_limit_in_bytes 2>/dev/null || true", timeout=10)
         
         # Apply I/O priority
-        self.adb.su(f"echo {res.blkio_weight} > {cgroup_base}/blkio{container_cgroup}/blkio.weight 2>/dev/null || true")
+        self.shell.run(f"echo {res.blkio_weight} > {cgroup_base}/blkio{container_cgroup}/blkio.weight 2>/dev/null || true", timeout=10)
         
         # Set OOM score adjustment for container init process
-        # This makes Android apps die before Gentoo processes
-        init_pid = self.adb.su(f"cat /sys/fs/cgroup/lxc/{container}/cgroup.procs 2>/dev/null | head -1", check=False).stdout.strip()
-        if init_pid:
-            self.adb.su(f"echo {res.oom_score_adj} > /proc/{init_pid}/oom_score_adj 2>/dev/null || true")
+        init_pid = self.shell.run_output(f"cat /sys/fs/cgroup/lxc/{container}/cgroup.procs 2>/dev/null | head -1")
+        if init_pid and init_pid.isdigit():
+            self.shell.run(f"echo {res.oom_score_adj} > /proc/{init_pid}/oom_score_adj 2>/dev/null || true", timeout=10)
         
-        # Throttle Android system services to give Gentoo more CPU
-        # Reduce CPU shares for Android's main cgroup
-        self.adb.su(f"echo 256 > {cgroup_base}/cpu/cpu.shares 2>/dev/null || true")
-        
-        # Lower priority for Android apps (zygote children)
-        self.adb.su("for pid in $(pgrep -f zygote); do renice 10 $pid 2>/dev/null; done || true", check=False)
-        
-        # Set ionice for Android to background class
-        self.adb.su("for pid in $(pgrep -f zygote); do ionice -c 3 -p $pid 2>/dev/null; done || true", check=False)
+        # Throttle Android system services (skip if it takes too long)
+        try:
+            self.shell.run(f"echo 256 > {cgroup_base}/cpu/cpu.shares 2>/dev/null || true", timeout=10)
+            self.shell.run("pgrep -f zygote | head -5 | xargs -I{} renice 10 {} 2>/dev/null || true", timeout=10)
+        except TimeoutError:
+            log_warn("Resource throttling timed out - skipping")
         
         log_ok(f"Resource priority applied: CPU={res.cpu_shares}, Mem={res.memory_limit_mb}MB, I/O={res.blkio_weight}")
     
     def _extract_on_host_and_push(self, tarball_remote: str, rootfs: str) -> None:
-        """Extract stage3 on host and push to device (fallback for limited Android tar)."""
+        """Convert xz to gzip on host, push to device, extract with toybox tar."""
         import tempfile
         
         tarball_local = self.cfg.artifacts_dir / self.cfg.gentoo.filename
@@ -1151,60 +1631,55 @@ ln -sf /usr/bin/doas /usr/bin/sudo
             die(f"Local tarball not found: {tarball_local}")
         
         with tempfile.TemporaryDirectory() as tmpdir:
-            extract_dir = Path(tmpdir) / "rootfs"
-            extract_dir.mkdir()
+            # Convert xz to gzip (toybox tar supports gzip but not xz)
+            gzip_tarball = Path(tmpdir) / "stage3.tar.gz"
+            gzip_remote = f"{self.cfg.device.tmp}/stage3.tar.gz"
             
-            log("Extracting on host (excluding device nodes)...")
-            # Use --exclude to skip device nodes that require root
-            # The container will create these at runtime
+            log("Converting xz to gzip (this takes a few minutes)...")
+            # Decompress xz and recompress as gzip
             result = subprocess.run(
-                ["tar", "-xJf", str(tarball_local), "-C", str(extract_dir),
-                 "--exclude=./dev/*", "--warning=no-unknown-keyword"],
-                capture_output=True, text=True, timeout=600
+                f"xz -dc '{tarball_local}' | gzip -1 > '{gzip_tarball}'",
+                shell=True, capture_output=True, text=True, timeout=600
             )
-            # Ignore errors about device nodes
-            if result.returncode != 0 and "Cannot mknod" not in result.stderr:
-                die(f"Host extraction failed: {result.stderr}")
+            if result.returncode != 0:
+                die(f"Conversion failed: {result.stderr}")
             
-            log("Streaming rootfs to device via tar (this takes a long time)...")
-            # Stream tar directly to device - avoids adb push permission issues
-            # Create tar on host, pipe through adb shell su to extract on device
-            self.adb.su(f"rm -rf '{rootfs}'/*")  # Clear any partial data
+            log(f"Pushing gzip tarball ({gzip_tarball.stat().st_size // (1024*1024)}MB)...")
+            if not self.adb.push(gzip_tarball, gzip_remote, timeout=600):
+                die("Failed to push gzip tarball")
+            log_ok("Gzip tarball pushed")
             
-            # Use tar to stream and extract in one pipeline
-            log("  Streaming (this may take 10+ minutes)...")
-            tar_cmd = subprocess.Popen(
-                ["tar", "-cf", "-", "-C", str(extract_dir), "."],
-                stdout=subprocess.PIPE
-            )
-            adb_cmd = subprocess.Popen(
-                ["adb", "shell", "su", "-c", f"tar -xf - -C '{rootfs}'"],
-                stdin=tar_cmd.stdout
-            )
-            tar_cmd.stdout.close()
-            adb_cmd.wait(timeout=3600)
+            # Clear rootfs and extract with toybox tar
+            log("Extracting on device...")
+            self.shell.run(f"rm -rf {rootfs}/*")
+            out, rc = self.shell.run(f"cd {rootfs} && tar -xzf {gzip_remote}", timeout=600)
+            if rc != 0:
+                log_warn(f"Extraction had issues: {out[:200]}")
             
-            if adb_cmd.returncode != 0:
-                log_warn("Tar stream had errors, checking result...")
+            # Clean up gzip tarball on device
+            self.shell.run(f"rm -f {gzip_remote}")
             
-            # Create /dev directory on device (will be populated by LXC)
-            self.adb.su(f"mkdir -p '{rootfs}/dev'")
-            
-            # Fix /var/empty ownership for sshd (must be owned by root)
-            self.adb.su(f"mkdir -p '{rootfs}/var/empty'")
-            self.adb.su(f"chown 0:0 '{rootfs}/var/empty' 2>/dev/null || true")
-            self.adb.su(f"chmod 755 '{rootfs}/var/empty'")
+            # Create /dev directory
+            self.shell.mkdir(f"{rootfs}/dev")
+            self.shell.run(f"mkdir -p {rootfs}/var/empty")
+            self.shell.run(f"chown 0:0 {rootfs}/var/empty 2>/dev/null || true")
+            self.shell.run(f"chmod 755 {rootfs}/var/empty")
     
     # -------------------------------------------------------------------------
     # Utility commands
     # -------------------------------------------------------------------------
     def run_all(self) -> None:
-        self.step1_build_lxc()
-        self.step2_prepare_rootfs()
-        self.step3_push_to_device()
-        self.step4_install_lxc()
-        self.step5_unpack_rootfs()
-        self.step6_configure_gentoo()
+        """Run all deployment steps."""
+        try:
+            self.step1_build_lxc()
+            self.step2_prepare_rootfs()
+            self.step3_push_to_device()
+            # Shell auto-connects on first use
+            self.step4_install_lxc()
+            self.step5_unpack_rootfs()
+            self.step6_configure_gentoo()
+        finally:
+            self.adb.close()
     
     def clean(self) -> None:
         step_header(0, 0, "Clean Everything")
@@ -1240,7 +1715,7 @@ ln -sf /usr/bin/doas /usr/bin/sudo
                 self.adb.rm(path)
                 log_ok(f"Removed: {path}")
             
-            self.adb.su(f"rm -f {self.cfg.device.tmp}/stage3*.tar.xz", check=False)
+            self.shell.run(f"rm -f {self.cfg.device.tmp}/stage3*.tar.xz")
         else:
             log_warn("Device not connected - skipping device cleanup")
         
@@ -1322,39 +1797,42 @@ def _setup_network(deployer: Deployer) -> None:
     """Setup bridge networking with NAT."""
     step_header(0, 0, "Setup Bridge Network")
     
-    cfg = deployer.cfg
-    adb = deployer.adb
-    net = cfg.network
+    net = deployer.cfg.network
+    shell = deployer.shell
+    host_iface = deployer._detect_host_interface()
     
     # Create bridge
-    r = adb.su(f"ip link show {net.bridge} 2>/dev/null", check=False)
-    if r.returncode != 0:
+    _, rc = shell.run(f"ip link show {net.bridge} 2>/dev/null")
+    if rc != 0:
         log(f"Creating bridge {net.bridge}...")
-        adb.su(f"ip link add name {net.bridge} type bridge")
-        adb.su(f"ip addr add {net.gateway}/24 dev {net.bridge}")
-        adb.su(f"ip link set {net.bridge} up")
+        shell.run(f"ip link add name {net.bridge} type bridge")
+        shell.run(f"ip addr add {net.gateway}/24 dev {net.bridge}")
+        shell.run(f"ip link set {net.bridge} up")
         log_ok(f"Bridge created: {net.gateway}")
     else:
         log(f"Bridge {net.bridge} exists")
     
     # IP forwarding
-    adb.su("sysctl -w net.ipv4.ip_forward=1")
+    shell.run("sysctl -w net.ipv4.ip_forward=1")
     log_ok("IP forwarding enabled")
     
     # NAT rules
-    nat = f"-s {net.subnet} -o {net.host_interface} -j MASQUERADE"
-    if adb.su(f"iptables -t nat -C POSTROUTING {nat} 2>/dev/null", check=False).returncode != 0:
-        adb.su(f"iptables -t nat -A POSTROUTING {nat}")
-        log_ok(f"NAT rule added for {net.subnet}")
+    nat = f"-s {net.subnet} -o {host_iface} -j MASQUERADE"
+    _, rc = shell.run(f"iptables -t nat -C POSTROUTING {nat} 2>/dev/null")
+    if rc != 0:
+        shell.run(f"iptables -t nat -A POSTROUTING {nat}")
+        log_ok(f"NAT rule added for {net.subnet} via {host_iface}")
     
     # Forward rules
-    fwd_out = f"-i {net.bridge} -o {net.host_interface} -j ACCEPT"
-    if adb.su(f"iptables -C FORWARD {fwd_out} 2>/dev/null", check=False).returncode != 0:
-        adb.su(f"iptables -A FORWARD {fwd_out}")
+    fwd_out = f"-i {net.bridge} -o {host_iface} -j ACCEPT"
+    _, rc = shell.run(f"iptables -C FORWARD {fwd_out} 2>/dev/null")
+    if rc != 0:
+        shell.run(f"iptables -A FORWARD {fwd_out}")
     
-    fwd_in = f"-i {net.host_interface} -o {net.bridge} -m state --state RELATED,ESTABLISHED -j ACCEPT"
-    if adb.su(f"iptables -C FORWARD {fwd_in} 2>/dev/null", check=False).returncode != 0:
-        adb.su(f"iptables -A FORWARD {fwd_in}")
+    fwd_in = f"-i {host_iface} -o {net.bridge} -m state --state RELATED,ESTABLISHED -j ACCEPT"
+    _, rc = shell.run(f"iptables -C FORWARD {fwd_in} 2>/dev/null")
+    if rc != 0:
+        shell.run(f"iptables -A FORWARD {fwd_in}")
     
     log_ok("Bridge network ready")
     

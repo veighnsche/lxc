@@ -1,3 +1,22 @@
+# Phase 3 - Step 1 - UoW 1: Update deploy.py to use deployer/
+
+**Parent:** phase-3.md → Step 1  
+**Goal:** Replace inline class definitions with imports from deployer/
+
+## Input Context
+- All deployer/*.py modules must exist and import successfully
+- Read current `deploy.py` lines 1815-1908 (CLI section to keep)
+
+## Tasks
+
+### 1. Backup original deploy.py
+```bash
+cp deploy.py deploy.py.bak
+```
+
+### 2. Replace deploy.py with thin CLI wrapper
+
+```python
 #!/usr/bin/env python3
 """
 deploy.py - Gentoo Linux LXC deployment on Android (ARM64)
@@ -132,3 +151,19 @@ def _setup_network(deployer: Deployer) -> None:
 
 if __name__ == "__main__":
     app()
+```
+
+### 3. Verify CLI works:
+```bash
+python3 deploy.py --help
+```
+
+## Expected Output
+- `deploy.py` reduced to ~120 lines
+- CLI help displays correctly
+- All imports resolve
+
+## Exit Criteria
+- [ ] deploy.py replaced with thin wrapper
+- [ ] `python3 deploy.py --help` works
+- [ ] Backup exists as deploy.py.bak

@@ -1,6 +1,0 @@
-id=lxc_sepolicy
-name=LXC SELinux Policy
-version=1.0
-versionCode=1
-author=TEAM_004
-description=SELinux policy for LXC container bridge networking

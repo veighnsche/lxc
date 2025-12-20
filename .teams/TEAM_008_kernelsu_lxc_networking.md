@@ -7,16 +7,19 @@
 
 Successfully integrated KernelSU with LXC to enable **isolated bridge networking** for the Gentoo container. This allows the container to have its own IP address (10.0.3.2) separate from Android's network stack - critical for the secrets vault use case.
 
+**UPDATE (TEAM_009):** KernelSU has been moved from `/reference/KernelSU` symlink to proper git submodule in `kernel/aosp/drivers/kernelsu_repo`. IPVLAN networking now works on WiFi!
+
 ---
 
 ## Key Achievements
 
 | Component | Status | Notes |
 |-----------|--------|-------|
-| KernelSU version fix | ✅ | Fixed version 16 → 32231 in Kbuild |
-| SELinux rules via ksud | ✅ | Bridge/veth creation now works |
+| KernelSU integration | ✅ | Now a git submodule in kernel repo |
+| SELinux rules via ksud | ✅ | Bridge/veth/ipvlan creation works |
 | Bridge networking | ✅ | Container at 10.0.3.2, isolated |
-| Macvlan on wlan0 | ❌ | WiFi driver limitation - not supported |
+| IPVLAN on wlan0 | ✅ | **TEAM_009: Now works!** Direct IP on LAN |
+| Macvlan on wlan0 | ❌ | WiFi driver limitation - use IPVLAN instead |
 | SSH in container | ✅ | Port 22 listening |
 | Deploy.py automation | ✅ | Full deployment is reproducible |
 
@@ -24,20 +27,15 @@ Successfully integrated KernelSU with LXC to enable **isolated bridge networking
 
 ## Critical Knowledge for Future Teams
 
-### 1. KernelSU Version Problem
+### 1. KernelSU Integration (Updated by TEAM_009)
 
-**Problem:** KernelSU defaults to version 16 when git is unavailable during Bazel build.
+**TEAM_009 UPDATE:** KernelSU is now properly integrated into the kernel as a git submodule:
+- **Location:** `kernel/aosp/drivers/kernelsu_repo` (git submodule)
+- **Symlink:** `kernel/aosp/drivers/kernelsu` → `kernelsu_repo/kernel`
+- **Makefile:** Added `obj-$(CONFIG_KSU) += kernelsu/` to `drivers/Makefile`
+- **Kconfig:** Added `source "drivers/kernelsu/Kconfig"` to `drivers/Kconfig`
 
-**Location:** `/home/vince/Projects/android/reference/KernelSU/kernel/Kbuild:51-55`
-
-**Fix:** Hardcode the version:
-```makefile
-# TEAM_008: Bazel sandbox prevents git access, hardcode version
-# Calculated: 30000 + 2231 (git rev-list --count HEAD) = 32231
-ccflags-y += -DKSU_VERSION=32231
-```
-
-**Why:** Bazel sandboxes the build environment, preventing git access. The fallback version 16 is rejected by KernelSU Manager (requires 22000+).
+The version is now automatically determined by the KernelSU Kbuild file. CONFIG_KSU defaults to `y` when KPROBES is enabled.
 
 ---
 
@@ -60,13 +58,19 @@ ksud sepolicy patch "allow shell self tun_socket { create read write ioctl }"
 
 ---
 
-### 3. Macvlan Does NOT Work on WiFi
+### 3. Networking on WiFi (Updated by TEAM_009)
 
-**Discovery:** Macvlan fails on wlan0 with "Operation not supported on transport endpoint"
+**MACVLAN:** Fails on wlan0 with "Operation not supported on transport endpoint"
+- WiFi drivers cannot support multiple MAC addresses on the same interface.
 
-**Reason:** WiFi drivers cannot support multiple MAC addresses on the same interface.
+**IPVLAN (TEAM_009 FIX):** Works on wlan0! 
+- IPVLAN L2 mode shares the parent's MAC address
+- Container gets a real IP on the home network (e.g., 192.168.178.100)
+- Direct SSH access: `ssh vince@192.168.178.100`
+- Requires kernel with `CONFIG_IPVLAN=y` and ABI-compatible patches
+- See `kernel/.teams/TEAM_009_investigate_ipvlan_bootloop.md` for details
 
-**Solution:** Use bridge networking with NAT instead:
+**Bridge (fallback):** Still works for isolated networking:
 - Bridge: `lxcbr0` at 10.0.3.1/24
 - Container: 10.0.3.2/24
 - NAT via iptables MASQUERADE
@@ -103,10 +107,11 @@ export XDG_CACHE_HOME=/data/local/tmp/.cache
 | File | Purpose |
 |------|---------|
 | `/home/vince/Projects/android/lxc/android/deploy.py` | Main deployment script |
-| `/home/vince/Projects/android/reference/KernelSU/kernel/Kbuild` | KernelSU build config (version fix) |
+| `/home/vince/Projects/android/kernel/aosp/drivers/kernelsu_repo/` | KernelSU git submodule |
+| `/home/vince/Projects/android/kernel/aosp/drivers/kernelsu` | Symlink to kernelsu_repo/kernel |
 | `/data/local/tmp/lxc/` | LXC installation on device |
 | `/data/lxc/containers/gentoo/` | Container config and rootfs |
-| `/data/local/tmp/gentoo-rootfs.img` | 100GB ext4 rootfs image |
+| `/data/local/tmp/gentoo-rootfs.img` | 32GB ext4 rootfs image |
 
 ---
 
@@ -133,18 +138,19 @@ adb shell "su -c 'nsenter -t \$(pgrep -f \"lxc-start.*gentoo\" | head -1) -n cat
 
 ## Known Issues / TODO
 
-1. **External SSH access** - TCP proxy needed for `ssh -p 2222 vince@localhost`
-   - Proxy script at `/data/local/tmp/ssh-proxy.sh`
-   - Needs manual start: `su -c '/data/local/tmp/ssh-proxy.sh &'`
+1. **IPVLAN mode (TEAM_009 SOLVED)** - Direct SSH access now works!
+   - Use `mode='ipvlan'` in NetworkConfig (now default)
+   - SSH directly: `ssh vince@192.168.178.100`
+   - No proxy needed!
 
 2. **Container restart** - After Android reboot:
-   - Bridge needs recreation
-   - SELinux rules need reapplication
+   - SELinux rules need reapplication (handled by deploy.py)
+   - For bridge mode: bridge needs recreation
    - Consider creating a boot script
 
 3. **lxc-attach broken** - Gets seccomp/capability errors
    - Use `nsenter` instead for now
-   - Or use SSH into container
+   - Or use SSH into container (preferred with IPVLAN)
 
 ---
 

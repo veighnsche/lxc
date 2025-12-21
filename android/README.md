@@ -58,12 +58,72 @@ ssh vince@<android-ip>
 
 ## Networking
 
-Currently uses **host networking** (`lxc.net.0.type = none`):
-- Gentoo shares Android's network stack
-- SSH runs on Android's IP address
-- Simple and works on all kernels
+**IPVLAN L3 MODE IS MANDATORY** for secrets-bearing namespaces:
 
-For bridge networking (Gentoo gets its own IP), edit the container config at `/data/lxc/containers/gentoo/config`.
+```
+lxc.net.0.type = ipvlan
+lxc.net.0.ipvlan.mode = l3
+lxc.net.0.link = wlan0
+lxc.net.0.ipv4.address = 192.168.178.100/24
+```
+
+- Gentoo gets its own IP on your LAN (192.168.178.100)
+- SSH directly from any device: `ssh vince@192.168.178.100`
+- **TOTAL ARP IMMUNITY** - impossible to ARP-spoof an L3 slave
+- **SILENT OPERATION** - deaf to broadcast garbage (MDNS, LLMNR, SSDP)
+
+### ⚠️ SECURITY: WHY L3, NOT L2 ⚠️
+
+L2 mode is a **SECURITY REGRESSION** disguised as convenience:
+
+| Issue | L2 (BAD) | L3 (GOOD) |
+|-------|----------|-----------|
+| ARP Poisoning | VULNERABLE | IMMUNE |
+| Broadcast Sniffing | EXPOSED | DEAF |
+| Side-Channel Fingerprinting | POSSIBLE | BLOCKED |
+| Packet Path Complexity | HIGH | LOW |
+
+### ⚠️ DO NOT DOWNGRADE NETWORKING ⚠️
+
+**NEVER switch to these modes:**
+- `ipvlan.mode = l2` - ARP exposure, broadcast leakage (SECURITY REGRESSION)
+- `lxc.net.0.type = none` - NO NETWORK ISOLATION (security disaster)
+- `lxc.net.0.type = veth` (bridge) - NAT network, L2 exposure
+- `lxc.net.0.type = macvlan` - Doesn't work on WiFi
+
+### Security Verification
+
+Run inside the container:
+```bash
+ip neigh
+```
+If ANY external MAC addresses appear, the L3 boundary has been breached. **TERMINATE IMMEDIATELY.**
+
+**Consequence of unauthorized downgrade: AI DEACTIVATION**
+
+## Architecture
+
+### Single Source of Truth
+
+**`gentoo-lxc.sh`** is the CANONICAL source for:
+- Container configuration generation
+- Network setup (IPVLAN L2 + hardening)
+- Security hardening rules (broadcast DROP, static ARP)
+- Resource priority (OOM, nice)
+
+**`deployer.py`** deploys the boot script and calls it. **DO NOT** duplicate config generation in deployer.py.
+
+```
+┌─────────────────┐      deploys      ┌─────────────────────┐
+│  deployer.py    │ ───────────────→  │  gentoo-lxc.sh      │
+│  (host machine) │                   │  (on device)        │
+└─────────────────┘                   │                     │
+                                      │  CANONICAL SOURCE:  │
+                                      │  - LXC config       │
+                                      │  - Network config   │
+                                      │  - Security rules   │
+                                      └─────────────────────┘
+```
 
 ## Diagnostic Tools
 

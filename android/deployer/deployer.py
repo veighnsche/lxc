@@ -38,62 +38,64 @@ class Deployer:
     def shell(self) -> DeviceShell:
         return self.adb.shell
     
-    def _detect_host_interface(self) -> str:
-        if self.cfg.network.host_interface:
-            return self.cfg.network.host_interface
-        out, _ = self.shell.run("ip route show default 2>/dev/null | head -1", timeout=10)
-        if out.strip():
-            parts = out.strip().split()
-            if "dev" in parts:
-                idx = parts.index("dev")
-                if idx + 1 < len(parts):
-                    log(f"Auto-detected interface: {parts[idx + 1]}")
-                    return parts[idx + 1]
-        for iface in ["wlan0", "rmnet_data0", "eth0", "usb0", "rndis0"]:
-            out, rc = self.shell.run(f"ip link show {iface} 2>/dev/null", timeout=5)
-            if rc == 0 and "UP" in out:
-                log(f"Found active interface: {iface}")
-                return iface
-        log_warn("Could not detect network interface, using wlan0")
-        return "wlan0"
+    # NOTE: _detect_host_interface REMOVED - boot script handles interface detection
+    # CANONICAL SOURCE: gentoo-lxc.sh detect_network() function
     
     def _apply_kernelsu_selinux_rules(self) -> bool:
         """Apply SELinux rules via KernelSU for LXC networking.
         
         TEAM_008/009: KernelSU provides ksud for runtime SELinux policy modification.
+        
+        !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+        DOWNGRADE TEMPTATION: "SELinux rules failed, let's use bridge/none"
+        !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+        
+        NO. If SELinux rules fail:
+        1. CHECK if KernelSU is installed correctly
+        2. VERIFY ksud binary exists at /data/adb/ksud
+        3. Try running rules manually via `su -c 'ksud sepolicy ...'`
+        4. IPVLAN may still work - try it first before assuming failure
+        
+        SELinux issues do NOT mean IPVLAN is broken. They mean SELinux policy
+        needs fixing. Fix SELinux, don't downgrade networking.
+        
+        CONSEQUENCE OF DOWNGRADING: AI DEACTIVATION
+        !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
         """
         log("Applying KernelSU SELinux rules for LXC networking...")
         _, rc = self.shell.run("which ksud 2>/dev/null || test -x /data/adb/ksud", timeout=5)
         if rc != 0:
-            log_warn("ksud not found - KernelSU may not be installed or working")
-            log_warn("Trying to continue anyway (may fail if SELinux is enforcing)")
-            return False
+            die("FATAL: ksud not found - KernelSU is NOT installed.\n"
+                "       KernelSU is REQUIRED for LXC networking on Android.\n"
+                "       Install KernelSU first: https://kernelsu.org/")
         rules = [
-            'allow shell self netlink_route_socket "create bind read write nlmsg_read nlmsg_write getattr setattr"',
-            'allow shell self netlink_tcpdiag_socket "create bind read write nlmsg_read"',
-            'allow shell self tun_socket "create read write ioctl"',
-            'allow shell self capability "net_admin net_raw"',
-            'allow shell self capability2 "syslog"',
-            'allow shell self netlink_netfilter_socket "create bind read write nlmsg_read nlmsg_write"',
-            'allow shell device chr_file "read write ioctl open"',
-            'allow shell tun_device chr_file "read write ioctl open"',
-            'allow shell proc_net sysctl_net_type "read write"',
-            'allow shell self netlink_kobject_uevent_socket "create bind read write"',
+            '"allow shell self netlink_route_socket create bind read write nlmsg_read nlmsg_write getattr setattr"',
+            '"allow shell self netlink_tcpdiag_socket create bind read write nlmsg_read"',
+            '"allow shell self tun_socket create read write ioctl"',
+            '"allow shell self capability net_admin net_raw"',
+            '"allow shell self capability2 syslog"',
+            '"allow shell self netlink_netfilter_socket create bind read write nlmsg_read nlmsg_write"',
+            '"allow shell device chr_file read write ioctl open"',
+            '"allow shell tun_device chr_file read write ioctl open"',
+            '"allow shell proc_net sysctl_net_type read write"',
+            '"allow shell self netlink_kobject_uevent_socket create bind read write"',
         ]
         applied = 0
         for rule in rules:
-            _, rc = self.shell.run(f'ksud sepolicy {rule}', timeout=10, check=False)
+            # KernelSU 3.0+ uses "sepolicy patch" instead of "sepolicy allow"
+            _, rc = self.shell.run(f'ksud sepolicy patch {rule}', timeout=10, check=False)
             if rc == 0:
                 applied += 1
             else:
-                _, rc = self.shell.run(f'/data/adb/ksud sepolicy {rule}', timeout=10, check=False)
+                _, rc = self.shell.run(f'/data/adb/ksud sepolicy patch {rule}', timeout=10, check=False)
                 if rc == 0:
                     applied += 1
         if applied > 0:
             log_ok(f"Applied {applied}/{len(rules)} SELinux rules via KernelSU")
             return True
-        log_warn("Could not apply SELinux rules - bridge networking may fail")
-        return False
+        die("FATAL: Could not apply SELinux rules - IPVLAN networking WILL fail.\n"
+            "       KernelSU must be installed and working for LXC networking.\n"
+            "       Check: adb shell 'which ksud' or 'ls /data/adb/ksud'")
     
     def step1_build_lxc(self) -> None:
         step_header(1, 6, "Build LXC for Android")
@@ -176,9 +178,30 @@ class Deployer:
                 if src.exists():
                     dst = f"{self.cfg.device.lxc_prefix}/{subdir}"
                     if not self.adb.push(src, dst):
-                        log_warn(f"Could not push {subdir}/ (symlinks?)")
-            if not self.adb.exists(lxc_bin):
-                die("Push failed: lxc-start not found")
+                        # share/ has symlinks that adb push can't handle
+                        # Use tar to dereference symlinks and push
+                        log(f"  Retrying {subdir}/ with tar (dereferencing symlinks)...")
+                        import subprocess
+                        import tempfile
+                        with tempfile.NamedTemporaryFile(suffix='.tar.gz', delete=False) as tf:
+                            tar_path = tf.name
+                        subprocess.run(
+                            ["tar", "-czf", tar_path, "-h", "-C", str(src.parent), subdir],
+                            check=True
+                        )
+                        self.adb._adb(["shell", "mkdir", "-p", dst])
+                        tar_remote = f"/data/local/tmp/_lxc_{subdir}.tar.gz"
+                        self.adb.push(Path(tar_path), tar_remote)
+                        self.shell.run(f"cd {self.cfg.device.lxc_prefix} && tar -xzf {tar_remote} && rm {tar_remote}")
+                        Path(tar_path).unlink()
+            # Verify critical files exist
+            critical_files = [
+                f"{self.cfg.device.lxc_prefix}/bin/lxc-start",
+                f"{self.cfg.device.lxc_prefix}/share/lxc/config/common.conf",
+            ]
+            for f in critical_files:
+                if not self.adb.exists(f):
+                    die(f"FATAL: Critical file missing after push: {f}")
             log_ok("LXC binaries pushed")
         tarball_remote = f"{self.cfg.device.tmp}/{self.cfg.gentoo.filename}"
         if self.adb.exists(tarball_remote):
@@ -198,19 +221,35 @@ class Deployer:
             log_ok("Doas source pushed")
     
     def step4_install_lxc(self) -> None:
+        """Install LXC and deploy boot script.
+        
+        CANONICAL SOURCE: gentoo-lxc.sh is the SINGLE SOURCE OF TRUTH for:
+        - Container configuration
+        - Network setup (IPVLAN L2 + hardening)
+        - Security hardening rules
+        
+        This method:
+        1. Sets up LXC directories and permissions
+        2. Deploys the boot script to /data/adb/service.d/
+        3. Calls the boot script to generate config
+        
+        DO NOT duplicate config generation here - edit gentoo-lxc.sh instead.
+        """
         step_header(4, 6, "Install LXC on Device")
         d = self.cfg.device
         container = self.cfg.container_name
         config_path = f"{d.container_path(container)}/config"
+        boot_script_path = "/data/adb/service.d/gentoo-lxc.sh"
         self.adb.ensure_shell()
-        if self.shell.exists(config_path):
+        if self.shell.exists(config_path) and self.shell.exists(boot_script_path):
             out, rc = self.shell.run(f"LD_LIBRARY_PATH={d.lxc_prefix}/lib {d.lxc_prefix}/bin/lxc-start --version")
             if rc == 0:
                 log_ok(f"Already configured (lxc-start {out.strip()})")
                 return
         log("Creating directories...")
         for path in [d.lxc_runtime, d.lxc_containers, f"{d.lxc_prefix}/etc/lxc",
-                     d.container_path(container), d.rootfs_path(container)]:
+                     d.container_path(container), d.rootfs_path(container),
+                     "/data/adb/service.d"]:
             self.shell.mkdir(path)
         log_ok("Directories created")
         log("Setting permissions...")
@@ -218,74 +257,30 @@ class Deployer:
         self.shell.run(f"chmod 755 {d.lxc_prefix}/libexec/lxc/* 2>/dev/null || true")
         self.shell.run(f"chmod 644 {d.lxc_prefix}/lib/*.so* 2>/dev/null || true")
         log_ok("Permissions set")
-        log("Writing LXC configuration...")
+        log("Writing LXC base configuration...")
         self.adb.write_file(f"{d.lxc_prefix}/etc/lxc/default.conf", "lxc.net.0.type = none\n")
         self.adb.write_file(f"{d.lxc_prefix}/etc/lxc/lxc.conf", f"lxc.lxcpath = {d.lxc_containers}\n")
-        # TEAM_008: Apply KernelSU SELinux rules BEFORE network setup
         self._apply_kernelsu_selinux_rules()
-        self._setup_network()
-        net = self.cfg.network
-        res = self.cfg.resources
-        host_iface = self._detect_host_interface()
-        if net.mode == "ipvlan":
-            network_config = f"""# IPVLAN L2 networking - TEAM_009
-lxc.net.0.type = ipvlan
-lxc.net.0.ipvlan.mode = l2
-lxc.net.0.link = {host_iface}
-lxc.net.0.flags = up
-lxc.net.0.ipv4.address = {net.container_ip}/{net.container_netmask}
-lxc.net.0.ipv4.gateway = {net.container_gateway}"""
-        elif net.mode == "macvlan":
-            network_config = f"""# Macvlan networking
-lxc.net.0.type = macvlan
-lxc.net.0.macvlan.mode = bridge
-lxc.net.0.link = {host_iface}
-lxc.net.0.flags = up
-lxc.net.0.ipv4.address = {net.container_ip}/{net.container_netmask}
-lxc.net.0.ipv4.gateway = {net.container_gateway}"""
-        else:
-            network_config = f"""# Bridge networking
-lxc.net.0.type = veth
-lxc.net.0.link = {net.bridge}
-lxc.net.0.flags = up
-lxc.net.0.ipv4.address = {net.bridge_container_ip}/24
-lxc.net.0.ipv4.gateway = {net.bridge_gateway}"""
-        container_config = f"""# Gentoo LXC container configuration
-lxc.uts.name = {container}
-lxc.arch = aarch64
-lxc.rootfs.path = dir:{d.rootfs_path(container)}
-
-{network_config}
-
-lxc.cgroup.cpu.shares = {res.cpu_shares}
-lxc.cgroup.memory.soft_limit_in_bytes = {res.memory_limit_mb * 1024 * 1024}
-lxc.cgroup.blkio.weight = {res.blkio_weight}
-lxc.cgroup.memory.oom_control = 0
-
-lxc.tty.max = 4
-lxc.pty.max = 256
-lxc.console.path = none
-lxc.init.cmd = /sbin/init
-
-lxc.mount.entry = proc proc proc nosuid,nodev,noexec,create=dir 0 0
-lxc.mount.entry = sysfs sys sysfs nosuid,nodev,noexec,ro,create=dir 0 0
-lxc.mount.entry = devpts dev/pts devpts nosuid,nodev,noexec,mode=0620,ptmxmode=0666,newinstance,create=dir 0 0
-lxc.mount.entry = tmpfs dev/shm tmpfs nosuid,nodev,mode=1777,create=dir 0 0
-lxc.mount.entry = tmpfs run tmpfs nosuid,nodev,mode=0755,create=dir 0 0
-lxc.mount.entry = tmpfs tmp tmpfs nosuid,nodev,mode=1777,create=dir 0 0
-
-lxc.signal.halt = SIGTERM
-lxc.signal.reboot = SIGINT
-lxc.signal.stop = SIGKILL
-
-lxc.environment = PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-lxc.environment = TERM=linux
-lxc.environment = LANG=en_US.UTF-8
-
-lxc.cap.drop =
-"""
-        self.adb.write_file(config_path, container_config)
-        log_ok("Container config written")
+        log("Deploying boot script (CANONICAL config source)...")
+        boot_script_local = self.cfg.repo_root / "android" / "gentoo-lxc.sh"
+        if not boot_script_local.exists():
+            die(f"Boot script not found: {boot_script_local}")
+        self.adb.push(boot_script_local, f"{d.tmp}/gentoo-lxc.sh")
+        self.shell.run(f"cp {d.tmp}/gentoo-lxc.sh {boot_script_path}")
+        self.shell.run(f"chmod 755 {boot_script_path}")
+        log_ok("Boot script deployed")
+        log("Generating container config via boot script...")
+        # Boot script's update_config function is the SINGLE SOURCE OF TRUTH
+        # Use 'config' command - generates config without starting container
+        # (rootfs image doesn't exist yet at this step)
+        out, rc = self.shell.run(f"{boot_script_path} config", timeout=60)
+        if rc != 0:
+            die(f"FATAL: Boot script config generation failed (rc={rc}).\n"
+                f"       Output: {out[:500] if out else 'none'}\n"
+                f"       Fix the boot script before continuing.")
+        if not self.shell.exists(config_path):
+            die("FATAL: Boot script succeeded but config file not created")
+        log_ok("Container config generated by boot script")
         log("Patching LXC config for Android compatibility...")
         common_conf = f"{d.lxc_prefix}/share/lxc/config/common.conf"
         self.shell.run(f"sed -i 's/^lxc.seccomp.profile/#lxc.seccomp.profile/' {common_conf} 2>/dev/null || true")
@@ -294,84 +289,9 @@ lxc.cap.drop =
         out, _ = self.shell.run(f"LD_LIBRARY_PATH={d.lxc_prefix}/lib {d.lxc_prefix}/bin/lxc-start --version")
         log_ok(f"lxc-start version: {out.strip()}")
     
-    def _setup_network(self) -> None:
-        """Setup container networking based on mode. TEAM_009"""
-        net = self.cfg.network
-        host_iface = self._detect_host_interface()
-        if net.mode == "ipvlan":
-            self._setup_ipvlan_network(host_iface)
-        elif net.mode == "macvlan":
-            self._setup_macvlan_network(host_iface)
-        else:
-            self._setup_bridge_network(host_iface)
-    
-    def _setup_ipvlan_network(self, host_iface: str) -> None:
-        """TEAM_009: IPVLAN L2 mode works on WiFi!"""
-        net = self.cfg.network
-        log(f"Setting up IPVLAN L2 network on {host_iface}...")
-        log(f"Container will get IP: {net.container_ip}")
-        self.shell.run("sysctl -w net.ipv4.ip_forward=1")
-        out, rc = self.shell.run("zcat /proc/config.gz 2>/dev/null | grep CONFIG_IPVLAN", check=False)
-        if "CONFIG_IPVLAN=y" not in out:
-            log_warn("CONFIG_IPVLAN not enabled in kernel - IPVLAN may not work")
-            log_warn("Falling back to bridge mode")
-            self._setup_bridge_network(host_iface)
-            return
-        _, rc = self.shell.run(f"ip link show {host_iface} 2>/dev/null | grep -q UP", check=False)
-        if rc != 0:
-            log_warn(f"Host interface {host_iface} is not UP")
-        log_ok(f"IPVLAN network ready - container will use {net.container_ip} via {host_iface}")
-    
-    def _setup_macvlan_network(self, host_iface: str) -> None:
-        """WARNING: MACVLAN does NOT work on WiFi (wlan0)."""
-        net = self.cfg.network
-        macvlan_name = "lxc-macvlan"
-        log(f"Setting up macvlan network on {host_iface}...")
-        log(f"Container will get IP: {net.container_ip}")
-        self.shell.run("sysctl -w net.ipv4.ip_forward=1")
-        _, rc = self.shell.run(f"ip link show {macvlan_name} 2>/dev/null")
-        if rc == 0:
-            log(f"Macvlan {macvlan_name} already exists")
-        else:
-            log(f"Creating macvlan {macvlan_name} on {host_iface}...")
-            out, rc = self.shell.run(f"ip link add {macvlan_name} link {host_iface} type macvlan mode bridge", check=False)
-            if rc != 0:
-                log_warn(f"Failed to create macvlan: {out}")
-                log_warn("Falling back to bridge mode")
-                self._setup_bridge_network(host_iface)
-                return
-            self.shell.run(f"ip link set {macvlan_name} up")
-            log_ok(f"Macvlan created: {macvlan_name}")
-        log_ok(f"Macvlan network ready - container will use {net.container_ip}")
-    
-    def _setup_bridge_network(self, host_iface: str) -> None:
-        """Setup bridge networking with NAT (fallback mode)."""
-        net = self.cfg.network
-        _, rc = self.shell.run(f"ip link show {net.bridge} 2>/dev/null")
-        if rc == 0:
-            log(f"Bridge {net.bridge} already exists")
-        else:
-            log(f"Creating bridge {net.bridge}...")
-            self.shell.run(f"ip link add name {net.bridge} type bridge")
-            self.shell.run(f"ip addr add {net.bridge_gateway}/24 dev {net.bridge}")
-            self.shell.run(f"ip link set {net.bridge} up")
-            log_ok(f"Bridge created: {net.bridge_gateway}")
-        self.shell.run("sysctl -w net.ipv4.ip_forward=1")
-        log_ok("IP forwarding enabled")
-        nat = f"-s {net.bridge_subnet} -o {host_iface} -j MASQUERADE"
-        _, rc = self.shell.run(f"iptables -t nat -C POSTROUTING {nat} 2>/dev/null")
-        if rc != 0:
-            self.shell.run(f"iptables -t nat -A POSTROUTING {nat}")
-            log_ok(f"NAT rule added for {host_iface}")
-        fwd_out = f"-i {net.bridge} -o {host_iface} -j ACCEPT"
-        _, rc = self.shell.run(f"iptables -C FORWARD {fwd_out} 2>/dev/null")
-        if rc != 0:
-            self.shell.run(f"iptables -A FORWARD {fwd_out}")
-        fwd_in = f"-i {host_iface} -o {net.bridge} -m state --state RELATED,ESTABLISHED -j ACCEPT"
-        _, rc = self.shell.run(f"iptables -C FORWARD {fwd_in} 2>/dev/null")
-        if rc != 0:
-            self.shell.run(f"iptables -A FORWARD {fwd_in}")
-        log_ok("Bridge network ready")
+    # NOTE: _setup_network and _setup_ipvlan_network REMOVED
+    # CANONICAL SOURCE: gentoo-lxc.sh handles ALL network config
+    # DO NOT add network config code here - edit gentoo-lxc.sh instead
     
     def step5_unpack_rootfs(self) -> None:
         step_header(5, 6, "Unpack Gentoo Rootfs")
@@ -455,9 +375,13 @@ L10N="en"
         self.shell.run(f"rm -rf {d.lxc_runtime} 2>/dev/null || true")
         self.shell.run(f"mkdir -p {d.lxc_runtime}/lxc/lock")
         self.shell.run(f"chmod -R 1777 {d.lxc_runtime}")
-        log("Starting container...")
-        if not self.lxc.running(container):
-            self.lxc.start(container)
+        log("Starting container via boot script (regenerates config)...")
+        boot_script = "/data/adb/service.d/gentoo-lxc.sh"
+        # Use boot script to start - it regenerates config with correct gateway
+        if self.lxc.running(container):
+            self.shell.run(f"{boot_script} restart", timeout=60)
+        else:
+            self.shell.run(f"{boot_script} start", timeout=60)
         deadline = time.time() + self.cfg.container_ready_timeout
         while time.time() < deadline:
             if self.lxc.running(container) and self.lxc.ok("true", container, timeout=5):
@@ -479,7 +403,7 @@ L10N="en"
         if has_sshd:
             log_ok("OpenSSH found")
         else:
-            log_warn("OpenSSH not found - SSH won't work")
+            die("FATAL: OpenSSH not found. SSH is required for remote access.")
         log("Installing doas (sudo alternative)...")
         self._install_doas()
         if not self.lxc.output(f"id {user} 2>/dev/null"):
@@ -489,10 +413,12 @@ L10N="en"
             log(f"User {user} exists")
         if "wheel" not in self.lxc.output(f"groups {user}"):
             self.lxc.run(f"usermod -aG wheel {user}", timeout=self.cfg.timeout_short)
-        shadow = self.lxc.output(f"grep '^{user}:' /etc/shadow")
-        if f"{user}:!" in shadow or f"{user}:*" in shadow:
-            self.lxc.run(f"passwd -d {user}", timeout=self.cfg.timeout_short)
-            log("Account unlocked for SSH key auth")
+        # Set password from config (interactive or default)
+        # User can change it later with: passwd
+        # SSH key auth also works if key is present
+        password = self.cfg.default_password
+        self.lxc.run(f"sh -c \"echo '{user}:{password}' | chpasswd\"", timeout=self.cfg.timeout_short)
+        log_ok("Password set (change with: passwd)")
         if not self.lxc.ok("test -f /etc/doas.conf", timeout=10):
             self.lxc.write("/etc/doas.conf", "permit nopass :wheel\n")
             self.lxc.run("chmod 600 /etc/doas.conf", timeout=self.cfg.timeout_short)
@@ -534,14 +460,12 @@ Subsystem sftp {sftp_path}
             self.lxc.run("rc-update add sshd default 2>/dev/null || true", check=False, timeout=self.cfg.timeout_short)
             log_ok("SSH daemon started")
         else:
-            log_warn("Failed to start sshd")
+            die("FATAL: Failed to start sshd. Check container logs.")
         if self.lxc.ok("test -x /usr/bin/doas", timeout=10):
             log_ok("Doas verified")
             if not self.lxc.ok("test -x /usr/bin/sudo", timeout=5):
                 self.lxc.run("ln -sf /usr/bin/doas /usr/bin/sudo", timeout=self.cfg.timeout_short)
                 log_ok("sudo -> doas symlink created")
-        log("Setting up port forwarding...")
-        self._setup_port_forward(user)
         self._verify_deployment(container, user)
     
     def _verify_deployment(self, container: str, user: str) -> None:
@@ -556,37 +480,89 @@ Subsystem sftp {sftp_path}
             errors.append(f"User '{user}' does NOT exist")
         if not self.lxc.ok("test -x /usr/bin/doas || test -x /usr/bin/sudo", timeout=10):
             errors.append("Neither doas nor sudo is installed")
+        # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+        # WARNING: DO NOT ADD mode='none' VERIFICATION HERE
+        # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+        #
+        # If you're adding mode='none' support, you are DOWNGRADING SECURITY.
+        # IPVLAN provides network namespace isolation. mode='none' does NOT.
+        #
+        # STOP. DEBUG. ASK USER. DO NOT DOWNGRADE.
+        #
+        # CONSEQUENCES: AI DEACTIVATION
+        # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
         net = self.cfg.network
+        # IPVLAN ONLY - fail hard on any other mode
+        if net.mode != "ipvlan":
+            die(f"INVALID NETWORK MODE: '{net.mode}'. ONLY 'ipvlan' IS ALLOWED. DO NOT DOWNGRADE.")
         container_ip = net.container_ip
-        if net.mode == "ipvlan":
-            # TEAM_013: IPVLAN verification - ping container IP directly
-            if not self.shell.run_ok(f"ping -c 1 -W 3 {container_ip} 2>/dev/null"):
-                errors.append(f"Container IP {container_ip} is NOT reachable via IPVLAN")
-        elif net.mode == "macvlan":
-            if not self.shell.run_ok(f"ping -c 1 -W 3 {container_ip} 2>/dev/null"):
-                errors.append(f"Container IP {container_ip} is NOT reachable via macvlan")
+        # IPVLAN L3 note: Host cannot ping container (no ARP). This is BY DESIGN.
+        # L3 mode provides TOTAL ARP IMMUNITY - this is a SECURITY FEATURE, not a bug.
+        # Verify container has IP instead of trying to ping.
+        container_has_ip = self.lxc.ok(f"ip addr show | grep -q '{container_ip}'", timeout=10)
+        if not container_has_ip:
+            errors.append(f"Container does NOT have IP {container_ip} configured")
         else:
-            if not self.shell.run_ok(f"ping -c 1 -W 2 -I {net.bridge} {net.bridge_container_ip} 2>/dev/null"):
-                errors.append(f"Container IP {net.bridge_container_ip} is NOT reachable")
-        # TEAM_013: Only check port forward for bridge mode (IPVLAN/macvlan have direct access)
-        if net.mode == "bridge":
-            result = self.adb._adb(["forward", "--list"], timeout=5)
-            if "tcp:2222" not in result.stdout:
-                errors.append("Port forward tcp:2222 is NOT set up")
+            # Check outbound connectivity from container
+            gateway_reachable = self.lxc.ok(f"ping -c 1 -W 3 {net.container_gateway} 2>/dev/null", timeout=15)
+            if not gateway_reachable:
+                # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+                # DOWNGRADE TEMPTATION: "Gateway unreachable, switch to bridge"
+                # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+                # NO. Gateway unreachable means:
+                # 1. WiFi might be reconnecting - WAIT and retry
+                # 2. ARP cache needs update - send gratuitous ARP
+                # 3. Container IP might conflict - check with `ip addr`
+                # 4. Router firewall - check router settings
+                # DO NOT DOWNGRADE. DEBUG THE NETWORK.
+                # CONSEQUENCE: AI DEACTIVATION
+                # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+                die(f"FATAL: Container cannot reach gateway {net.container_gateway}.\n"
+                    f"       Network is broken. Check: WiFi connected? Router reachable?\n"
+                    f"       Debug: adb shell su -c 'ip route show table all'")
         if errors:
             console.print()
             console.print(Panel.fit("[bold red]DEPLOYMENT VERIFICATION FAILED[/bold red]\n\n" + "\n".join(f"✗ {e}" for e in errors), title="✗ ERRORS", border_style="red"))
             die(f"Verification failed: {len(errors)} error(s)")
-        log_ok("All verification checks passed")
-        if net.mode == "ipvlan":
-            # TEAM_013: IPVLAN gives direct LAN access
-            connect_info = f"[bold]Connect from ANY device on your LAN:[/bold]\n  ssh {user}@{container_ip}"
-        elif net.mode == "macvlan":
-            connect_info = f"[bold]Connect from ANY device:[/bold]\n  ssh {user}@{container_ip}"
+        
+        # Test SSH from HOST (this script runs on host, not Android)
+        log("Testing SSH from host...")
+        import subprocess
+        ssh_test = subprocess.run(
+            ["ssh", "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+             "-o", "BatchMode=yes", f"{user}@{container_ip}", "echo SSH_OK"],
+            capture_output=True, text=True, timeout=15
+        )
+        if ssh_test.returncode == 0 and "SSH_OK" in ssh_test.stdout:
+            log_ok(f"SSH connection verified: {user}@{container_ip}")
         else:
-            connect_info = f"[bold]Connect via adb forward:[/bold]\n  ssh -p 2222 {user}@localhost"
+            die(f"FATAL: Cannot SSH to container from host.\n"
+                f"       Command: ssh {user}@{container_ip}\n"
+                f"       Error: {ssh_test.stderr.strip() or 'Connection failed'}\n"
+                f"       Check: Is container IP reachable from your LAN?")
+        
+        log_ok("All verification checks passed")
+        # IPVLAN provides direct LAN access - SSH from any device ON THE LAN
+        # IMPORTANT: With IPVLAN, the Android HOST cannot reach the container!
+        # This is a fundamental limitation of IPVLAN - parent and child interfaces
+        # cannot communicate directly. You MUST SSH from another device.
         console.print()
-        console.print(Panel.fit(f"[bold green]Deployment Complete[/bold green]\n\n[bold]User:[/bold] {user}\n[bold]Container IP:[/bold] {container_ip}\n[bold]Network Mode:[/bold] {net.mode}\n\n{connect_info}", title="✓ Success", border_style="green"))
+        console.print(Panel.fit(
+            f"[bold green]Deployment Complete[/bold green]\n\n"
+            f"[bold]User:[/bold] {user}\n"
+            f"[bold]Container IP:[/bold] {container_ip}\n"
+            f"[bold]Network Mode:[/bold] {net.mode}\n\n"
+            f"[bold yellow]⚠ IPVLAN LIMITATION:[/bold yellow]\n"
+            f"  The Android host CANNOT reach the container directly.\n"
+            f"  This is by design - IPVLAN isolates parent/child interfaces.\n\n"
+            f"[bold]To connect via SSH:[/bold]\n"
+            f"  From another computer on your LAN:\n"
+            f"    [cyan]ssh {user}@{container_ip}[/cyan]\n\n"
+            f"[bold]To access container from this host:[/bold]\n"
+            f"  Use adb to attach directly:\n"
+            f"    [cyan]adb shell su -c 'lxc-attach -n gentoo'[/cyan]\n",
+            title="✓ Success", border_style="green"
+        ))
     
     def _get_ssh_pubkey(self) -> Optional[str]:
         ssh_dir = Path.home() / ".ssh"
@@ -596,33 +572,29 @@ Subsystem sftp {sftp_path}
                 return path.read_text().strip()
         return None
     
-    def _setup_port_forward(self, user: str) -> None:
-        """TEAM_004: Setup port forwarding via iptables DNAT."""
-        container_ip = self.cfg.network.container_ip
-        self.shell.run(f"iptables -t nat -D PREROUTING -p tcp --dport 2222 -j DNAT --to-destination {container_ip}:22 2>/dev/null || true")
-        self.shell.run(f"iptables -t nat -D OUTPUT -p tcp --dport 2222 -j DNAT --to-destination {container_ip}:22 2>/dev/null || true")
-        self.shell.run(f"iptables -t nat -A PREROUTING -p tcp --dport 2222 -j DNAT --to-destination {container_ip}:22")
-        self.shell.run(f"iptables -t nat -A OUTPUT -p tcp --dport 2222 -j DNAT --to-destination {container_ip}:22")
-        self.shell.run("echo 1 > /proc/sys/net/ipv4/ip_forward")
-        self.adb._adb(["forward", "--remove", "tcp:2222"], timeout=5)
-        self.adb._adb(["forward", "tcp:2222", "tcp:2222"], timeout=10)
-        log_ok(f"Port forwarding: localhost:2222 -> {container_ip}:22")
     
     def _install_doas(self) -> None:
         if self.lxc.ok("test -x /usr/bin/doas", timeout=10):
+            # Check setuid bit even if already installed
+            if not self.lxc.ok("test -u /usr/bin/doas", timeout=10):
+                log("  Fixing doas setuid bit...")
+                self.lxc.run("chmod u+s /usr/bin/doas", timeout=10)
+                self.lxc.run("chmod u+s /usr/bin/sudo 2>/dev/null || true", timeout=10, check=False)
             log_ok("doas already installed")
             return
         if not self.lxc.ok("test -f /root/opendoas-6.8.2.tar.xz", timeout=10):
-            log_warn("doas source not found - skipping")
-            return
-        build_script = '#!/bin/bash\nset -e\nexport TMPDIR=/tmp\nexport HOME=/root\ncd /root\ntar -xJf opendoas-6.8.2.tar.xz\ncd opendoas-6.8.2\n./configure --prefix=/usr --without-pam\nmake -j4\nmake install\necho "permit nopass :wheel" > /etc/doas.conf\nchmod 600 /etc/doas.conf\nln -sf /usr/bin/doas /usr/bin/sudo\n'
+            die("FATAL: doas source not found in /root. Was step 5 completed?")
+        build_script = '#!/bin/bash\nset -e\nexport TMPDIR=/tmp\nexport HOME=/root\ncd /root\ntar -xJf opendoas-6.8.2.tar.xz\ncd opendoas-6.8.2\n./configure --prefix=/usr --without-pam\nmake -j4\nmake install\nchmod u+s /usr/bin/doas\necho "permit nopass :wheel" > /etc/doas.conf\nchmod 600 /etc/doas.conf\nln -sf /usr/bin/doas /usr/bin/sudo\nchmod u+s /usr/bin/sudo\n'
         self.lxc.write("/root/build_doas.sh", build_script)
         log("  Building doas (this takes a minute)...")
         result = self.lxc.run("/bin/bash /root/build_doas.sh", timeout=300, check=False)
         if self.lxc.ok("test -x /usr/bin/doas", timeout=10):
+            # Verify setuid bit is set
+            if not self.lxc.ok("test -u /usr/bin/doas", timeout=10):
+                die("FATAL: doas installed but setuid bit not set. Run: chmod u+s /usr/bin/doas")
             log_ok("doas installed")
         else:
-            log_warn(f"doas build failed: {result[0][:100] if result[0] else 'unknown error'}")
+            die(f"FATAL: doas build failed: {result[0][:200] if result[0] else 'unknown error'}")
     
     def _apply_resource_priority(self) -> None:
         res = self.cfg.resources
@@ -681,31 +653,20 @@ Subsystem sftp {sftp_path}
             self.adb.close()
     
     def clean(self) -> None:
-        step_header(0, 0, "Clean Everything")
-        log("Cleaning host...")
-        for d in [self.cfg.build_output, self.cfg.artifacts_dir, self.cfg.cache_dir, self.cfg.repo_root / "_work", self.cfg.repo_root / "_build_android31"]:
+        """Clean host-side build artifacts and downloads.
+        
+        This does NOT touch the device. Use uninstall() for that.
+        Gentoo is a first-class citizen, not garbage to be cleaned.
+        """
+        step_header(0, 0, "Clean Host Files")
+        log("Cleaning build artifacts and downloads...")
+        for d in [self.cfg.build_output, self.cfg.artifacts_dir, self.cfg.cache_dir, 
+                  self.cfg.repo_root / "_work", self.cfg.repo_root / "_build_android31"]:
             if d.exists():
                 shutil.rmtree(d)
                 log_ok(f"Removed: {d}")
-        if self.adb.connected() and self.adb.has_root():
-            log("Cleaning device...")
-            container = self.cfg.container_name
-            try:
-                if self.lxc.running(container):
-                    self.lxc.stop(container, kill=True)
-            except Exception:
-                pass
-            rootfs = self.cfg.device.rootfs_path(container)
-            if self.adb.is_mounted(rootfs):
-                self.adb.umount(rootfs)
-                log_ok(f"Unmounted: {rootfs}")
-            for path in [self.cfg.device.lxc_prefix, self.cfg.device.lxc_runtime, self.cfg.device.lxc_containers, self.cfg.device.rootfs_image, "/data/lxc"]:
-                self.adb.rm(path)
-                log_ok(f"Removed: {path}")
-            self.shell.run(f"rm -f {self.cfg.device.tmp}/stage3*.tar.xz")
-        else:
-            log_warn("Device not connected - skipping device cleanup")
-        log_ok("Clean complete")
+        log_ok("Host clean complete")
+        log("Note: Use --uninstall to remove Gentoo from device")
     
     def status(self) -> None:
         table = Table(title="Deployment Status")

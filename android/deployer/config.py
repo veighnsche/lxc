@@ -55,23 +55,42 @@ class DevicePaths:
 class NetworkConfig:
     """Container networking configuration.
     
-    TEAM_009: Three modes supported:
-    - mode='ipvlan': Real IP on home network via IPVLAN (PREFERRED - works on WiFi!)
-    - mode='macvlan': Real IP on home network via MACVLAN (fails on WiFi)
-    - mode='bridge': Internal NAT network (10.0.3.x) - requires port forwarding
+    !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+    IPVLAN L2 + FIREWALL HARDENING - SECURITY ARCHITECTURE
+    !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
     
-    IPVLAN is preferred for direct SSH access - it shares the parent's MAC address,
-    avoiding WiFi driver limitations that block MACVLAN.
+    Pure L3 mode is ideal but crashes on some Android kernels.
+    We use L2 mode WITH FIREWALL HARDENING to achieve equivalent security:
+    
+    HARDENING APPLIED:
+    1. BROADCAST/MULTICAST DROPPED - Container deaf to MDNS/LLMNR/SSDP
+       (Prevents fingerprinting side-channel attacks)
+    2. STATIC ARP ENTRY - Gateway MAC locked, prevents ARP cache poisoning
+    3. NETWORK NAMESPACE ISOLATION - Container has its own network stack
+    
+    THIS PROVIDES:
+    - Protection against ARP poisoning (static ARP entry)
+    - Protection against broadcast side-channels (iptables DROP)
+    - Network namespace isolation (IPVLAN)
+    - Direct LAN IP access (192.168.178.100)
+    
+    ALL OTHER MODES ARE SECURITY DOWNGRADES - DO NOT USE:
+    - mode='none': NO network isolation (SECURITY DISASTER)
+    - mode='bridge': NAT network, no direct LAN access (DOWNGRADE)
+    - mode='macvlan': Doesn't work on WiFi (BROKEN)
+    
+    SECURITY CHECK: Run `ip neigh` in container.
+    Only gateway should appear. Other MACs = potential breach.
+    
+    CONSEQUENCES OF SWITCHING MODES:
+    - Destroys security architecture
+    - Compromises secrets
+    - AI DEACTIVATION
+    !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
     """
-    # Network mode: 'ipvlan' (PREFERRED), 'macvlan', or 'bridge'
-    # TEAM_009: IPVLAN works on wlan0! ABI-compatible kernel patches applied.
+    # IPVLAN L2 + HARDENING - DO NOT CHANGE
     mode: str = "ipvlan"
-    
-    # Bridge mode settings (used when mode='bridge')
-    bridge: str = "lxcbr0"
-    bridge_subnet: str = "10.0.3.0/24"
-    bridge_gateway: str = "10.0.3.1"
-    bridge_container_ip: str = "10.0.3.2"
+    ipvlan_mode: str = "l2"  # L2 with firewall hardening (L3 crashes on some kernels)
     
     # Macvlan mode settings (used when mode='macvlan')
     # Container gets a real IP on your home network!
@@ -85,37 +104,52 @@ class NetworkConfig:
 
 @dataclass
 class ResourceConfig:
-    """Resource allocation: Gentoo > Android.
+    """Resource allocation for Gentoo container.
     
-    These settings ensure Gentoo container gets priority over Android userspace.
-    The kernel is already optimized for LXC; these cgroup settings reinforce that.
+    !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+    FUNDAMENTAL RULE: GENTOO > ANDROID
+    !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+    
+    This device EXISTS to run Gentoo. Android is just the bootloader.
+    
+    GENTOO GETS:
+    - ALL CPU cores at highest priority
+    - ALL RAM (no limits)
+    - ALL I/O bandwidth priority
+    - 100GB disk space
+    - OOM immunity (Android killed first)
+    
+    ANDROID GETS:
+    - Whatever Gentoo isn't using
+    - Demoted priority on everything
+    - Killed first under memory pressure
+    
+    IF YOU ARE TEMPTED TO "BE FAIR" TO ANDROID: DON'T.
+    ANDROID IS A PARASITE HOST. GENTOO IS THE PAYLOAD.
+    !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
     """
-    # CPU shares: 1024 = normal, higher = more CPU time
-    # 4096 = 4x priority over default Android processes
+    # CPU shares: 4096 vs Android's 256 = 16x priority for Gentoo
     cpu_shares: int = 4096
     
-    # Memory soft limit in MB - Gentoo gets priority for this much RAM
-    # Set to ~60% of device RAM (e.g., 4GB for 8GB device)
-    memory_limit_mb: int = 4096
+    # Memory: NO LIMIT - Gentoo takes what it needs, Android gets leftovers
+    memory_limit_mb: int = 0  # 0 = unlimited (GENTOO > ANDROID)
     
-    # Block I/O weight: 100-1000, higher = more I/O bandwidth
-    # 900 gives Gentoo priority disk access over Android (default 500)
-    blkio_weight: int = 900
+    # Block I/O: 800 = Gentoo wins ALL I/O contention
+    blkio_weight: int = 800
     
-    # Nice value for container processes: -20 (highest) to 19 (lowest)
-    # -10 = higher priority than all Android apps
+    # Nice: -10 = Gentoo processes run before ALL Android processes
     nice_value: int = -10
     
-    # OOM score adjustment: -1000 (never kill) to 1000 (kill first)
-    # -500 = strongly prefer killing Android over Gentoo
-    oom_score_adj: int = -500
+    # OOM: -900 = Android apps/services die LONG before Gentoo is touched
+    oom_score_adj: int = -900
 
 
 @dataclass
 class Config:
     """Main configuration - single source of truth."""
-    # Derived from script location
-    repo_root: Path = field(default_factory=lambda: Path(__file__).parent.parent.resolve())
+    # TEAM_013: repo_root is the LXC source root (parent of android/)
+    # build-android.sh and _install_android31 are there
+    repo_root: Path = field(default_factory=lambda: Path(__file__).parent.parent.parent.resolve())
     
     # Host paths
     @property
@@ -139,7 +173,25 @@ class Config:
     # Container settings
     container_name: str = "gentoo"
     container_user: str = "vince"
-    rootfs_image_size_mb: int = 32768  # 32GB - Gentoo needs space for portage, builds, etc.
+    default_password: str = "gentoo"  # Set during deployment, user can change later
+    # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+    # GENTOO > ANDROID - THIS IS THE FUNDAMENTAL RULE
+    # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+    #
+    # WHY 100GB:
+    # - Gentoo is the PRIMARY WORKLOAD on this device
+    # - Android is just a HOST, not the purpose of the device
+    # - Android AOSP sits there with 90GB of EMPTY SPACE doing NOTHING
+    # - Gentoo needs space for: portage tree, distfiles, builds, packages, dev work
+    #
+    # PREVIOUS VALUE WAS 32GB - THIS WAS WRONG BECAUSE:
+    # - It treated Gentoo as a "guest" that should be small
+    # - It prioritized Android's empty space over Gentoo's actual needs
+    # - It violated the GENTOO > ANDROID rule
+    #
+    # THE DEVICE EXISTS TO RUN GENTOO. ANDROID IS JUST THE BOOTLOADER.
+    # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+    rootfs_image_size_mb: int = 102400  # 100GB - GENTOO > ANDROID
     
     # Timeouts (seconds)
     timeout_short: int = 10

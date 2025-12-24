@@ -84,7 +84,10 @@ class LXC:
             timeout: int = 60, check: bool = True) -> tuple[str, int]:
         """Run command inside container. Returns (output, returncode)."""
         name = self._resolve_name(name)
-        full_cmd = f"lxc-attach -n {name} -P {self.cfg.device.lxc_containers} -e -- {cmd}"
+        # TEAM_026: Use --keep-env --elevated-privileges to bypass capability issues
+        # Use /bin/bash -c to ensure we use container's shell with proper PATH
+        escaped_cmd = cmd.replace("'", "'\\''")
+        full_cmd = f"lxc-attach -n {name} -P {self.cfg.device.lxc_containers} --keep-env --elevated-privileges -- /bin/bash -c 'export PATH=/usr/sbin:/usr/bin:/sbin:/bin; {escaped_cmd}'"
         out, rc = self._run(full_cmd, timeout=timeout)
         if check and rc != 0:
             raise RuntimeError(f"Container command failed (rc={rc}): {out[:200]}")

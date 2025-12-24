@@ -1,54 +1,59 @@
 #!/system/bin/sh
 # ##############################################################################
-# GENTOO LXC BOOT SCRIPT - CANONICAL SOURCE OF TRUTH
+# ROCKY LINUX LXC BOOT SCRIPT - CANONICAL SOURCE OF TRUTH
 # ##############################################################################
 #
-# FUNDAMENTAL RULE: GENTOO > ANDROID
+# TEAM_022: Migrated from Gentoo to Rocky Linux 10.
+# Binary Sovereignty: No compilation, immutable base, 2-year stability.
 #
-# This device EXISTS to run Gentoo. Android is just the bootloader.
+# FUNDAMENTAL RULE: ROCKY > ANDROID
+#
+# This device EXISTS to run Rocky Linux. Android is just the bootloader.
 # Android AOSP sits with 90GB of EMPTY SPACE doing NOTHING.
-# Gentoo gets ALL the resources it needs. Android gets leftovers.
+# Rocky gets ALL the resources it needs. Android gets leftovers.
 #
-# RESOURCE PRIORITY (GENTOO WINS EVERYTHING):
-#   - CPU shares: 4096 (Gentoo) vs 256 (Android) = 16x priority
-#   - OOM score: -900 (Gentoo NEVER killed, Android sacrificed first)
-#   - Nice: -10 (Gentoo) vs +10 (Android zygote demoted)
-#   - I/O weight: 800 (Gentoo wins ALL I/O contention)
+# RESOURCE PRIORITY (ROCKY WINS EVERYTHING):
+#   - CPU shares: 4096 (Rocky) vs 256 (Android) = 16x priority
+#   - OOM score: -900 (Rocky NEVER killed, Android sacrificed first)
+#   - Nice: -10 (Rocky) vs +10 (Android zygote demoted)
+#   - I/O weight: 800 (Rocky wins ALL I/O contention)
 #   - Disk: 100GB rootfs (Android's empty space is WASTED space)
 #
 # IF YOU ARE TEMPTED TO "BE FAIR" TO ANDROID: DON'T.
-# ANDROID IS A PARASITE HOST. GENTOO IS THE PAYLOAD.
+# ANDROID IS A PARASITE HOST. ROCKY IS THE PAYLOAD.
 # ##############################################################################
 #
 # Usage:
-#   gentoo-lxc.sh          - Boot mode (start + watchdog)
-#   gentoo-lxc.sh start    - Start container
-#   gentoo-lxc.sh stop     - Stop container
-#   gentoo-lxc.sh restart  - Restart container
-#   gentoo-lxc.sh watch    - Run watchdog loop
-#   gentoo-lxc.sh status   - Show status
+#   rocky-lxc.sh          - Boot mode (start + watchdog)
+#   rocky-lxc.sh start    - Start container
+#   rocky-lxc.sh stop     - Stop container
+#   rocky-lxc.sh restart  - Restart container
+#   rocky-lxc.sh watch    - Run watchdog loop
+#   rocky-lxc.sh status   - Show status
 
-LOGFILE=/data/local/tmp/gentoo-lxc.log
+LOGFILE=/data/local/tmp/rocky-lxc.log
 LXC_PREFIX=/data/local/tmp/lxc
 LXC_CONTAINERS=/data/lxc/containers
 LXC_RUNTIME=/data/local/tmp/lxc-run
+# TEAM_022: Keeping rootfs image name for backward compatibility
 ROOTFS_IMAGE=/data/local/tmp/gentoo-rootfs.img
-CONTAINER=gentoo
-CONFIG_FILE=/data/lxc/containers/gentoo/config
+CONTAINER=rocky
+CONFIG_FILE=/data/lxc/containers/rocky/config
 
-# RESOURCE PRIORITY SETTINGS - Gentoo > Android
-CPU_SHARES_GENTOO=4096      # 4x default, Gentoo wins CPU contention
-CPU_SHARES_ANDROID=256      # Reduced from 1024, Android yields to Gentoo
+# RESOURCE PRIORITY SETTINGS - Rocky > Android
+CPU_SHARES_ROCKY=4096       # 4x default, Rocky wins CPU contention
+CPU_SHARES_ANDROID=256      # Reduced from 1024, Android yields to Rocky
 BLKIO_WEIGHT=800            # I/O priority (100-1000, higher wins)
-OOM_SCORE_ADJ=-900          # Never kill Gentoo (-1000 to 1000)
-NICE_GENTOO=-10             # High priority (-20 to 19)
+OOM_SCORE_ADJ=-900          # Never kill Rocky (-1000 to 1000)
+NICE_ROCKY=-10              # High priority (-20 to 19)
 NICE_ANDROID=10             # Low priority for Android zygote
 
-# TEAM_020: Thermal guard settings (GS101 SoC protection)
-TEMP_LIMIT=52000            # Stop builds above 52°C (millidegrees)
-TEMP_RESUME=48000           # Resume builds below 48°C (hysteresis)
+# TEAM_022: Thermal guard settings (GS101 SoC protection)
+# Updated for Rocky: target dnf/rpm instead of emerge
+TEMP_LIMIT=52000            # Stop heavy processes above 52°C (millidegrees)
+TEMP_RESUME=48000           # Resume below 48°C (hysteresis)
 BUILDS_STOPPED=0            # State: 0=running, 1=stopped
-WAKELOCK_NAME="gentoo_server_lock"
+WAKELOCK_NAME="rocky_server_lock"
 
 export HOME=/data/local/tmp
 export LXC_RUNTIME_DIR=/data/local/tmp/lxc-run
@@ -130,13 +135,13 @@ ensure_ssh_keepalive() {
     log "Ensuring SSH keepalive configuration..."
     
     # Check if keepalive is already configured with correct value
-    if $LXC_PREFIX/bin/lxc-attach -n $CONTAINER -P $LXC_CONTAINERS -- grep -q "ClientAliveInterval 15" /etc/ssh/sshd_config 2>/dev/null; then
+    if $LXC_PREFIX/bin/lxc-attach -e -n $CONTAINER -P $LXC_CONTAINERS -- grep -q "ClientAliveInterval 15" /etc/ssh/sshd_config 2>/dev/null; then
         log "SSH keepalive already configured (15s)"
         return 0
     fi
     
     # Remove old keepalive config and add new aggressive settings
-    $LXC_PREFIX/bin/lxc-attach -n $CONTAINER -P $LXC_CONTAINERS -- /bin/sh -c '
+    $LXC_PREFIX/bin/lxc-attach -e -n $CONTAINER -P $LXC_CONTAINERS -- /bin/sh -c '
         # Remove any existing keepalive settings
         sed -i "/ClientAliveInterval/d" /etc/ssh/sshd_config
         sed -i "/ClientAliveCountMax/d" /etc/ssh/sshd_config
@@ -163,7 +168,7 @@ ensure_ssh_keepalive() {
 prioritize_sshd() {
     log "Setting sshd to real-time priority..."
     
-    $LXC_PREFIX/bin/lxc-attach -n $CONTAINER -P $LXC_CONTAINERS -- /bin/sh -c '
+    $LXC_PREFIX/bin/lxc-attach -e -n $CONTAINER -P $LXC_CONTAINERS -- /bin/sh -c '
         for pid in $(pgrep sshd); do
             # Highest nice value
             renice -n -20 $pid 2>/dev/null
@@ -259,13 +264,14 @@ get_cpu_temp() {
     cat /sys/class/thermal/thermal_zone0/temp 2>/dev/null
 }
 
-# Stop build processes when overheating
+# Stop heavy processes when overheating
+# TEAM_022: Updated for Rocky Linux - target dnf/rpm instead of emerge
 thermal_stop_builds() {
     if [ "$BUILDS_STOPPED" -eq 1 ]; then
         return 0
     fi
     
-    log "THERMAL: Stopping builds (temp > ${TEMP_LIMIT}m°C)"
+    log "THERMAL: Stopping heavy processes (temp > ${TEMP_LIMIT}m°C)"
     
     # Get container init PID
     local container_pid=""
@@ -277,22 +283,24 @@ thermal_stop_builds() {
     done
     
     if [ -n "$container_pid" ]; then
+        # TEAM_022: Rocky uses dnf/rpm instead of emerge
         nsenter -t $container_pid -p -m -- /bin/sh -c '
-            pkill -STOP -f "emerge\|ebuild\|sandbox\|cc1\|cc1plus\|make\|ninja\|cargo\|rustc" 2>/dev/null
+            pkill -STOP -f "dnf\|rpm\|yum\|podman\|buildah" 2>/dev/null
         ' 2>/dev/null
     fi
     
     BUILDS_STOPPED=1
-    log "Build processes stopped"
+    log "Heavy processes stopped"
 }
 
-# Resume build processes when cooled down
+# Resume heavy processes when cooled down
+# TEAM_022: Updated for Rocky Linux
 thermal_resume_builds() {
     if [ "$BUILDS_STOPPED" -eq 0 ]; then
         return 0
     fi
     
-    log "THERMAL: Resuming builds (temp < ${TEMP_RESUME}m°C)"
+    log "THERMAL: Resuming processes (temp < ${TEMP_RESUME}m°C)"
     
     local container_pid=""
     for cg in /sys/fs/cgroup/lxc.payload.$CONTAINER /sys/fs/cgroup/lxc.payload.$CONTAINER-*; do
@@ -303,13 +311,14 @@ thermal_resume_builds() {
     done
     
     if [ -n "$container_pid" ]; then
+        # TEAM_022: Rocky uses dnf/rpm instead of emerge
         nsenter -t $container_pid -p -m -- /bin/sh -c '
-            pkill -CONT -f "emerge\|ebuild\|sandbox\|cc1\|cc1plus\|make\|ninja\|cargo\|rustc" 2>/dev/null
+            pkill -CONT -f "dnf\|rpm\|yum\|podman\|buildah" 2>/dev/null
         ' 2>/dev/null
     fi
     
     BUILDS_STOPPED=0
-    log "Build processes resumed"
+    log "Processes resumed"
 }
 
 # Check thermal and take action
@@ -405,7 +414,7 @@ update_config() {
     detect_network || return 1
     
     cat > $CONFIG_FILE << EOF
-# Gentoo LXC - TEAM_011 dynamic config
+# Rocky Linux LXC - TEAM_022 dynamic config
 # Updated: $(date)
 # !!! IPVLAN ONLY - DO NOT CHANGE TO none/veth/macvlan !!!
 lxc.uts.name = $CONTAINER
@@ -423,15 +432,15 @@ lxc.net.0.flags = up
 lxc.net.0.ipv4.address = $CONTAINER_IP/$NETMASK
 lxc.net.0.ipv4.gateway = $GATEWAY
 
-lxc.cgroup.cpu.shares = 4096
-lxc.cgroup.memory.soft_limit_in_bytes = 0
-lxc.cgroup.blkio.weight = 800
-lxc.cgroup.memory.oom_control = 0
+# TEAM_025: Cgroup settings - only memory+pids available in cgroup2 on this kernel
+# CPU/IO controllers not enabled, so we skip those settings
+# Resource priority is applied via nice/ionice in apply_resource_priority() instead
 
 lxc.tty.max = 4
 lxc.pty.max = 256
 lxc.console.path = none
-lxc.init.cmd = /sbin/init
+# TEAM_022: Rocky Linux 10 GenericCloud uses systemd
+lxc.init.cmd = /usr/lib/systemd/systemd
 
 lxc.mount.entry = proc proc proc nosuid,nodev,noexec,create=dir 0 0
 lxc.mount.entry = sysfs sys sysfs nosuid,nodev,noexec,ro,create=dir 0 0
@@ -439,14 +448,35 @@ lxc.mount.entry = devpts dev/pts devpts nosuid,nodev,noexec,mode=0620,ptmxmode=0
 lxc.mount.entry = tmpfs dev/shm tmpfs nosuid,nodev,mode=1777,create=dir 0 0
 lxc.mount.entry = tmpfs run tmpfs nosuid,nodev,mode=0755,create=dir 0 0
 lxc.mount.entry = tmpfs tmp tmpfs nosuid,nodev,mode=1777,create=dir 0 0
+# TEAM_022: Mount cgroup for systemd
+lxc.mount.entry = cgroup2 sys/fs/cgroup cgroup2 rw,create=dir 0 0
 
-lxc.signal.halt = SIGTERM
+# TEAM_029: Allow standard character devices for systemd service spawning
+# Without these, systemd-executor gets EPERM opening /dev/null -> exit code 208/STDIN
+lxc.cgroup2.devices.allow = c 1:3 rwm
+lxc.cgroup2.devices.allow = c 1:5 rwm
+lxc.cgroup2.devices.allow = c 1:7 rwm
+lxc.cgroup2.devices.allow = c 1:8 rwm
+lxc.cgroup2.devices.allow = c 1:9 rwm
+lxc.cgroup2.devices.allow = c 5:0 rwm
+lxc.cgroup2.devices.allow = c 5:1 rwm
+lxc.cgroup2.devices.allow = c 5:2 rwm
+lxc.cgroup2.devices.allow = c 136:* rwm
+# TEAM_028: TUN/TAP passthrough for Tailscale VPN (The Vault)
+# Allow access to TUN device (character device major 10, minor 200)
+lxc.cgroup2.devices.allow = c 10:200 rwm
+# Bind mount TUN device from Android host
+lxc.mount.entry = /dev/net/tun dev/net/tun none bind,create=file 0 0
+
+lxc.signal.halt = SIGRTMIN+3
 lxc.signal.reboot = SIGINT
-lxc.signal.stop = SIGKILL
+lxc.signal.stop = SIGRTMIN+14
 
 lxc.environment = PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 lxc.environment = TERM=linux
 lxc.environment = LANG=en_US.UTF-8
+# TEAM_022: Systemd container detection
+lxc.environment = container=lxc
 
 lxc.cap.drop =
 EOF
@@ -474,7 +504,7 @@ start_container() {
     else
         log "Mounting rootfs..."
         losetup -D 2>/dev/null || true
-        # TEAM_016: suid,dev,exec required for doas/sudo and device nodes (see TEAM_014/015)
+        # TEAM_016: suid,dev,exec required for sudo and device nodes (see TEAM_014/015)
         mount -o loop,rw,suid,dev,exec $ROOTFS_IMAGE $ROOTFS || {
             log "Mount failed, retrying..."
             sleep 1
@@ -501,10 +531,10 @@ start_container() {
         # TEAM_021: Ensure SSH keepalive is configured (survives container restart)
         ensure_ssh_keepalive
         # Start SSH if not running
-        $LXC_PREFIX/bin/lxc-attach -n $CONTAINER -P $LXC_CONTAINERS -- /usr/sbin/sshd 2>/dev/null
+        $LXC_PREFIX/bin/lxc-attach -e -n $CONTAINER -P $LXC_CONTAINERS -- /usr/sbin/sshd 2>/dev/null
         # TEAM_021: Give sshd real-time priority (survives heavy compilation)
         prioritize_sshd
-        # CRITICAL: Apply resource priority - Gentoo > Android
+        # CRITICAL: Apply resource priority - Rocky > Android
         apply_resource_priority
         # CRITICAL: Announce container IP to network (gratuitous ARP)
         # Without this, other devices on LAN may not know how to reach container
@@ -516,9 +546,9 @@ start_container() {
     fi
 }
 
-# CRITICAL: Apply resource priority so Gentoo ALWAYS wins over Android
+# CRITICAL: Apply resource priority so Rocky ALWAYS wins over Android
 apply_resource_priority() {
-    log "Applying resource priority (Gentoo > Android)..."
+    log "Applying resource priority (Rocky > Android)..."
     
     # cgroup v2 path for container (handle -N suffix on restarts)
     CONTAINER_CGROUP=""
@@ -526,22 +556,22 @@ apply_resource_priority() {
         [ -d "$cg" ] && CONTAINER_CGROUP="$cg" && break
     done
     
-    # 1. Get all Gentoo container processes
-    GENTOO_PIDS=$(cat $CONTAINER_CGROUP/cgroup.procs 2>/dev/null)
-    GENTOO_COUNT=0
+    # 1. Get all Rocky container processes
+    ROCKY_PIDS=$(cat $CONTAINER_CGROUP/cgroup.procs 2>/dev/null)
+    ROCKY_COUNT=0
     
-    for pid in $GENTOO_PIDS; do
-        # OOM score: -900 = NEVER kill Gentoo (Android killed first)
+    for pid in $ROCKY_PIDS; do
+        # OOM score: -900 = NEVER kill Rocky (Android killed first)
         echo $OOM_SCORE_ADJ > /proc/$pid/oom_score_adj 2>/dev/null
-        # Nice: -10 = HIGH priority for Gentoo processes
-        renice $NICE_GENTOO $pid 2>/dev/null
+        # Nice: -10 = HIGH priority for Rocky processes
+        renice $NICE_ROCKY $pid 2>/dev/null
         # I/O priority: real-time class (highest)
         ionice -c 1 -n 0 -p $pid 2>/dev/null
-        GENTOO_COUNT=$((GENTOO_COUNT + 1))
+        ROCKY_COUNT=$((ROCKY_COUNT + 1))
     done
-    log "  Gentoo: $GENTOO_COUNT processes set to nice=$NICE_GENTOO, OOM=$OOM_SCORE_ADJ"
+    log "  Rocky: $ROCKY_COUNT processes set to nice=$NICE_ROCKY, OOM=$OOM_SCORE_ADJ"
     
-    # 2. THROTTLE ANDROID - reduce priority so Gentoo wins
+    # 2. THROTTLE ANDROID - reduce priority so Rocky wins
     ANDROID_COUNT=0
     
     # Renice Android's zygote (app spawner) to LOW priority
@@ -549,7 +579,7 @@ apply_resource_priority() {
         renice $NICE_ANDROID $pid 2>/dev/null
         # I/O priority: best-effort class (lower)
         ionice -c 2 -n 7 -p $pid 2>/dev/null
-        # OOM score: +500 = kill Android apps before Gentoo
+        # OOM score: +500 = kill Android apps before Rocky
         echo 500 > /proc/$pid/oom_score_adj 2>/dev/null
         ANDROID_COUNT=$((ANDROID_COUNT + 1))
     done
@@ -568,28 +598,49 @@ apply_resource_priority() {
     done
     
     log "  Android: $ANDROID_COUNT processes set to nice=$NICE_ANDROID, OOM=+500"
-    log "Resource priority applied: Gentoo WINS over Android"
+    log "Resource priority applied: Rocky WINS over Android"
 }
 
 # Stop container with full cleanup
 # TEAM_018: Comprehensive cleanup to prevent stale IPVLAN/zombie issues
 # TEAM_020: Added IPVLAN IP release to fix "Address already in use" on restart
+# TEAM_026: Fixed lxc-stop hanging - use timeout wrapper and aggressive kill
 stop_container() {
     log "Stopping container..."
     
-    # 1. Try graceful stop first
-    $LXC_PREFIX/bin/lxc-stop -n $CONTAINER -P $LXC_CONTAINERS -t 5 2>/dev/null
+    # TEAM_026: Kill any existing hung lxc-stop processes first
+    pkill -9 -f "lxc-stop.*$CONTAINER" 2>/dev/null
     sleep 1
     
-    # 2. Force kill if still running
+    # 1. Try graceful stop with timeout wrapper (lxc-stop -t doesn't work reliably)
+    # Use timeout command if available, otherwise background with sleep+kill
+    if command -v timeout >/dev/null 2>&1; then
+        timeout 5 $LXC_PREFIX/bin/lxc-stop -n $CONTAINER -P $LXC_CONTAINERS 2>/dev/null
+    else
+        $LXC_PREFIX/bin/lxc-stop -n $CONTAINER -P $LXC_CONTAINERS 2>/dev/null &
+        local stop_pid=$!
+        sleep 5
+        kill -9 $stop_pid 2>/dev/null
+    fi
+    
+    # 2. Force kill if still running - also with timeout
     if is_running; then
         log "Force killing container..."
-        $LXC_PREFIX/bin/lxc-stop -n $CONTAINER -P $LXC_CONTAINERS -k 2>/dev/null
-        sleep 1
+        if command -v timeout >/dev/null 2>&1; then
+            timeout 3 $LXC_PREFIX/bin/lxc-stop -n $CONTAINER -P $LXC_CONTAINERS -k 2>/dev/null
+        else
+            $LXC_PREFIX/bin/lxc-stop -n $CONTAINER -P $LXC_CONTAINERS -k 2>/dev/null &
+            local stop_pid=$!
+            sleep 3
+            kill -9 $stop_pid 2>/dev/null
+        fi
     fi
     
     # 3. Kill any orphaned lxc-start processes for this container
     pkill -9 -f "lxc-start.*$CONTAINER" 2>/dev/null
+    
+    # 3b. TEAM_026: Also kill container init processes directly
+    pkill -9 -f "sleep infinity" 2>/dev/null
     
     # 4. Clean up stale lock files
     rm -f $LXC_RUNTIME/lxc/lock/lxc/$CONTAINER/* 2>/dev/null
@@ -617,7 +668,7 @@ stop_container() {
 # TEAM_018: Prevents multiple watchdogs running
 kill_existing_watchdog() {
     local my_pid=$$
-    for pid in $(pgrep -f "gentoo-lxc.sh watch" 2>/dev/null); do
+    for pid in $(pgrep -f "rocky-lxc.sh watch" 2>/dev/null); do
         if [ "$pid" != "$my_pid" ]; then
             kill -9 $pid 2>/dev/null
         fi
@@ -709,16 +760,18 @@ wait_for_network() {
 
 # Health check - verify container is actually reachable
 # TEAM_018: Detects zombie containers where IPVLAN is broken
+# TEAM_025: Fixed - ping doesn't work with IPVLAN (host can't ping container)
+#           Use lxc-attach instead which works regardless of network mode
 container_healthy() {
     if ! is_running; then
         return 1
     fi
-    # Check if we can ping the container IP (quick check)
-    if [ -n "$CONTAINER_IP" ]; then
-        ping -c 1 -W 1 $CONTAINER_IP >/dev/null 2>&1
-        return $?
+    # TEAM_025: Use lxc-attach to verify container responsiveness
+    # This works with IPVLAN where host cannot ping container (by design)
+    if $LXC_PREFIX/bin/lxc-attach -e -n $CONTAINER -P $LXC_CONTAINERS -- /bin/true 2>/dev/null; then
+        return 0
     fi
-    # Fallback: check if init process is responsive
+    # Fallback: check if init process exists
     local init_pid=$($LXC_PREFIX/bin/lxc-info -n $CONTAINER -P $LXC_CONTAINERS -p 2>/dev/null | grep -oE '[0-9]+')
     if [ -n "$init_pid" ] && [ -d "/proc/$init_pid" ]; then
         return 0
@@ -742,11 +795,27 @@ watchdog() {
         CUR_SIG=$(get_net_sig)
         
         # Case 1: Network went down
+        # TEAM_027: Add grace period - brief WiFi hiccups shouldn't kill the container
         if [ -z "$CUR_SIG" ]; then
             if [ $NETWORK_DOWN -eq 0 ]; then
-                log "Network lost - stopping container and waiting for recovery"
-                stop_container
-                NETWORK_DOWN=1
+                # Wait and retry before declaring network lost
+                log "Network check failed, waiting for recovery..."
+                NETWORK_RETRY=0
+                while [ $NETWORK_RETRY -lt 3 ]; do
+                    sleep 10
+                    CUR_SIG=$(get_net_sig)
+                    if [ -n "$CUR_SIG" ]; then
+                        log "Network recovered after brief hiccup"
+                        break
+                    fi
+                    NETWORK_RETRY=$((NETWORK_RETRY + 1))
+                done
+                # Only stop container if network is still down after retries
+                if [ -z "$CUR_SIG" ]; then
+                    log "Network lost (confirmed after 30s) - stopping container"
+                    stop_container
+                    NETWORK_DOWN=1
+                fi
             fi
             # Wait briefly then continue loop (will retry)
             continue
@@ -813,7 +882,7 @@ watchdog() {
 
 # Show status
 show_status() {
-    echo "=== Gentoo LXC Status ==="
+    echo "=== Rocky LXC Status ==="
     if is_running; then
         echo "Container: RUNNING"
         $LXC_PREFIX/bin/lxc-info -n $CONTAINER -P $LXC_CONTAINERS 2>/dev/null

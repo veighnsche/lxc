@@ -1,4 +1,4 @@
-"""Configuration dataclasses for Gentoo LXC deployment."""
+"""Configuration dataclasses for Rocky Linux LXC deployment."""
 
 from __future__ import annotations
 
@@ -8,31 +8,42 @@ from typing import Optional
 
 
 @dataclass
-class GentooConfig:
-    """Gentoo stage3 artifact configuration."""
-    version: str = "20251214T234555Z"
-    arch: str = "arm64"
-    variant: str = "openrc"
+class RockyConfig:
+    """Rocky Linux 10 GenericCloud artifact configuration.
+    
+    TEAM_022: Migrated from Gentoo to Rocky Linux 10.
+    TEAM_025: REVERTED to Rocky 10 GenericCloud (qcow2) - full systemd image.
+    Binary Sovereignty: No compilation, immutable base, 2-year stability.
+    
+    CRITICAL: Must use Rocky Linux 10, NOT 9!
+    """
+    version: str = "10"
+    arch: str = "aarch64"
+    variant: str = "GenericCloud-Base"  # Full systemd cloud image
     
     @property
     def filename(self) -> str:
-        return f"stage3-{self.arch}-{self.variant}-{self.version}.tar.xz"
+        # Rocky Linux 10 GenericCloud qcow2 image
+        return f"Rocky-{self.version}-{self.variant}.latest.{self.arch}.qcow2"
+    
+    @property
+    def rootfs_filename(self) -> str:
+        # Extracted rootfs tarball from qcow2
+        return f"rocky-{self.version}-{self.arch}-rootfs.tar.gz"
     
     @property
     def base_url(self) -> str:
-        return f"https://distfiles.gentoo.org/releases/{self.arch}/autobuilds/{self.version}"
+        # Rocky Linux official mirror - use dl.rockylinux.org (not download.)
+        return f"https://dl.rockylinux.org/pub/rocky/{self.version}/images/{self.arch}"
     
     @property
-    def stage3_url(self) -> str:
+    def image_url(self) -> str:
         return f"{self.base_url}/{self.filename}"
     
     @property
-    def digests_url(self) -> str:
-        return f"{self.stage3_url}.DIGESTS"
-    
-    @property
-    def binhost_url(self) -> str:
-        return f"https://distfiles.gentoo.org/releases/{self.arch}/binpackages/17.0/{self.arch}/"
+    def checksum_url(self) -> str:
+        # CHECKSUM file in same directory
+        return f"{self.base_url}/CHECKSUM"
 
 
 @dataclass
@@ -42,6 +53,8 @@ class DevicePaths:
     lxc_prefix: str = "/data/local/tmp/lxc"
     lxc_runtime: str = "/data/local/tmp/lxc-run"
     lxc_containers: str = "/data/lxc/containers"
+    # TEAM_022: Keeping filename for backward compatibility
+    # Can be renamed to rocky-rootfs.img in future cleanup
     rootfs_image: str = "/data/local/tmp/gentoo-rootfs.img"
     
     def container_path(self, name: str) -> str:
@@ -104,15 +117,15 @@ class NetworkConfig:
 
 @dataclass
 class ResourceConfig:
-    """Resource allocation for Gentoo container.
+    """Resource allocation for Rocky Linux container.
     
     !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-    FUNDAMENTAL RULE: GENTOO > ANDROID
+    FUNDAMENTAL RULE: ROCKY > ANDROID
     !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
     
-    This device EXISTS to run Gentoo. Android is just the bootloader.
+    This device EXISTS to run Rocky Linux. Android is just the bootloader.
     
-    GENTOO GETS:
+    ROCKY GETS:
     - ALL CPU cores at highest priority
     - ALL RAM (no limits)
     - ALL I/O bandwidth priority
@@ -120,27 +133,27 @@ class ResourceConfig:
     - OOM immunity (Android killed first)
     
     ANDROID GETS:
-    - Whatever Gentoo isn't using
+    - Whatever Rocky isn't using
     - Demoted priority on everything
     - Killed first under memory pressure
     
     IF YOU ARE TEMPTED TO "BE FAIR" TO ANDROID: DON'T.
-    ANDROID IS A PARASITE HOST. GENTOO IS THE PAYLOAD.
+    ANDROID IS A PARASITE HOST. ROCKY IS THE PAYLOAD.
     !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
     """
-    # CPU shares: 4096 vs Android's 256 = 16x priority for Gentoo
+    # CPU shares: 4096 vs Android's 256 = 16x priority for Rocky
     cpu_shares: int = 4096
     
-    # Memory: NO LIMIT - Gentoo takes what it needs, Android gets leftovers
-    memory_limit_mb: int = 0  # 0 = unlimited (GENTOO > ANDROID)
+    # Memory: NO LIMIT - Rocky takes what it needs, Android gets leftovers
+    memory_limit_mb: int = 0  # 0 = unlimited (ROCKY > ANDROID)
     
-    # Block I/O: 800 = Gentoo wins ALL I/O contention
+    # Block I/O: 800 = Rocky wins ALL I/O contention
     blkio_weight: int = 800
     
-    # Nice: -10 = Gentoo processes run before ALL Android processes
+    # Nice: -10 = Rocky processes run before ALL Android processes
     nice_value: int = -10
     
-    # OOM: -900 = Android apps/services die LONG before Gentoo is touched
+    # OOM: -900 = Android apps/services die LONG before Rocky is touched
     oom_score_adj: int = -900
 
 
@@ -165,33 +178,35 @@ class Config:
         return self.repo_root / "_cache"
     
     # Sub-configs
-    gentoo: GentooConfig = field(default_factory=GentooConfig)
+    rocky: RockyConfig = field(default_factory=RockyConfig)
     device: DevicePaths = field(default_factory=DevicePaths)
     network: NetworkConfig = field(default_factory=NetworkConfig)
     resources: ResourceConfig = field(default_factory=ResourceConfig)
     
     # Container settings
-    container_name: str = "gentoo"
+    # TEAM_022: Container name kept as 'gentoo' for backward compatibility
+    # with existing deployments. Can be renamed to 'rocky' in future.
+    container_name: str = "rocky"
     container_user: str = "vince"
-    default_password: str = "gentoo"  # Set during deployment, user can change later
+    default_password: str = "rocky"  # Set during deployment, user can change later
     # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-    # GENTOO > ANDROID - THIS IS THE FUNDAMENTAL RULE
+    # ROCKY > ANDROID - THIS IS THE FUNDAMENTAL RULE
     # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
     #
     # WHY 100GB:
-    # - Gentoo is the PRIMARY WORKLOAD on this device
+    # - Rocky is the PRIMARY WORKLOAD on this device (The Sovereign Vault)
     # - Android is just a HOST, not the purpose of the device
     # - Android AOSP sits there with 90GB of EMPTY SPACE doing NOTHING
-    # - Gentoo needs space for: portage tree, distfiles, builds, packages, dev work
+    # - Rocky needs space for: Forgejo repos, Vaultwarden data, container images
     #
     # PREVIOUS VALUE WAS 32GB - THIS WAS WRONG BECAUSE:
-    # - It treated Gentoo as a "guest" that should be small
-    # - It prioritized Android's empty space over Gentoo's actual needs
-    # - It violated the GENTOO > ANDROID rule
+    # - It treated the container as a "guest" that should be small
+    # - It prioritized Android's empty space over actual workload needs
+    # - It violated the ROCKY > ANDROID rule
     #
-    # THE DEVICE EXISTS TO RUN GENTOO. ANDROID IS JUST THE BOOTLOADER.
+    # THE DEVICE EXISTS TO RUN ROCKY. ANDROID IS JUST THE BOOTLOADER.
     # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-    rootfs_image_size_mb: int = 102400  # 100GB - GENTOO > ANDROID
+    rootfs_image_size_mb: int = 102400  # 100GB - ROCKY > ANDROID
     
     # Timeouts (seconds)
     timeout_short: int = 10

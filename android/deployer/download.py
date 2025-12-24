@@ -1,4 +1,9 @@
-"""Download utilities and cryptographic operations."""
+"""Download utilities and cryptographic operations.
+
+TEAM_022: Updated for Rocky Linux 10 migration.
+Removed Gentoo-specific SHA512 DIGESTS parsing.
+Added SHA256 CHECKSUM parsing for Rocky Linux.
+"""
 
 from __future__ import annotations
 
@@ -48,36 +53,29 @@ class Crypto:
     """Cryptographic operations."""
     
     @staticmethod
-    def sha512_file(path: Path) -> str:
-        h = hashlib.sha512()
+    def sha256_file(path: Path) -> str:
+        """Calculate SHA256 hash of a file."""
+        h = hashlib.sha256()
         with open(path, "rb") as f:
             for chunk in iter(lambda: f.read(65536), b""):
                 h.update(chunk)
         return h.hexdigest().lower()
     
     @staticmethod
-    def parse_gentoo_digests(content: str, filename: str) -> Optional[str]:
-        """Extract SHA512 hash from Gentoo DIGESTS file.
+    def parse_rocky_checksum(content: str, filename: str) -> Optional[str]:
+        """Extract SHA256 hash from Rocky Linux CHECKSUM file.
         
-        The DIGESTS file format has sections like:
-        # SHA512 HASH
-        <hash> <filename>
+        TEAM_022: Rocky Linux CHECKSUM format:
+        SHA256 (filename) = <hash>
         
-        We need to find the hash for our specific filename in the SHA512 section.
+        Example:
+        SHA256 (Rocky-10.0-GenericCloud-Base-10.0-aarch64.raw.xz) = abc123...
         """
-        in_sha512 = False
         for line in content.split('\n'):
             line = line.strip()
-            if 'SHA512' in line and 'HASH' in line:
-                in_sha512 = True
-                continue
-            if in_sha512:
-                if line.startswith('#') or not line:
-                    # End of SHA512 section or comment - keep looking
-                    if line.startswith('#') and 'HASH' in line:
-                        in_sha512 = False  # New hash section started
-                    continue
-                parts = line.split()
-                if len(parts) >= 2 and filename in parts[-1]:
-                    return parts[0].lower()
+            # Match: SHA256 (filename) = hash
+            if line.startswith('SHA256') and filename in line:
+                parts = line.split('=')
+                if len(parts) == 2:
+                    return parts[1].strip().lower()
         return None

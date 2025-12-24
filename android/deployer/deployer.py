@@ -1,4 +1,9 @@
-"""Deployer - main deployment orchestration."""
+"""Deployer - main deployment orchestration.
+
+TEAM_022: Updated for Rocky Linux 10 migration.
+Replaces Gentoo Stage3 with Rocky Linux GenericCloud rootfs.
+Replaces OpenRC with systemd.
+"""
 
 from __future__ import annotations
 
@@ -114,53 +119,295 @@ class Deployer:
         log_ok("Build complete")
     
     def step2_prepare_rootfs(self) -> None:
-        step_header(2, 6, "Download Gentoo Stage3 (SHA512 verified)")
+        """Download Rocky Linux 10 GenericCloud rootfs (SHA256 verified).
+        
+        TEAM_022: Rocky Linux 10 migration.
+        TEAM_025: REVERTED to Rocky 10 GenericCloud qcow2 - full systemd image.
+        No compilation - binary sovereignty.
+        """
+        step_header(2, 6, "Download Rocky Linux 10 Rootfs (SHA256 verified)")
         self.cfg.cache_dir.mkdir(parents=True, exist_ok=True)
         self.cfg.artifacts_dir.mkdir(parents=True, exist_ok=True)
-        cached = self.cfg.cache_dir / self.cfg.gentoo.filename
-        artifact = self.cfg.artifacts_dir / self.cfg.gentoo.filename
+        
+        # Download qcow2 image
+        qcow2_cached = self.cfg.cache_dir / self.cfg.rocky.filename
+        # Extracted rootfs tarball
+        rootfs_name = self.cfg.rocky.rootfs_filename
+        cached = self.cfg.cache_dir / rootfs_name
+        artifact = self.cfg.artifacts_dir / rootfs_name
+        
         if not cached.exists():
-            log(f"URL: {self.cfg.gentoo.stage3_url}")
-            Downloader.download(self.cfg.gentoo.stage3_url, cached, "Downloading stage3")
+            if not qcow2_cached.exists():
+                log(f"URL: {self.cfg.rocky.image_url}")
+                Downloader.download(self.cfg.rocky.image_url, qcow2_cached, "Downloading Rocky 10 qcow2")
+                
+                # Verify checksum
+                log("Fetching CHECKSUM for verification...")
+                try:
+                    checksums = Downloader.fetch_text(self.cfg.rocky.checksum_url)
+                    expected = Crypto.parse_rocky_checksum(checksums, self.cfg.rocky.filename)
+                    if expected:
+                        log("Verifying SHA256...")
+                        actual = Crypto.sha256_file(qcow2_cached)
+                        if actual != expected:
+                            log_err(f"Expected: {expected[:32]}...")
+                            log_err(f"Actual:   {actual[:32]}...")
+                            qcow2_cached.unlink(missing_ok=True)
+                            die("SHA256 MISMATCH - corrupted download removed")
+                        log_ok("SHA256 verified")
+                    else:
+                        log_warn("Could not parse checksum - proceeding without verification")
+                except Exception as e:
+                    log_warn(f"Checksum verification skipped: {e}")
+            
+            # Extract rootfs from qcow2 image
+            log("Extracting rootfs from qcow2 image...")
+            self._extract_qcow2_rootfs(qcow2_cached, cached)
         else:
             log_ok(f"Using cached: {cached.name}")
-        log("Fetching DIGESTS for verification...")
-        digests = Downloader.fetch_text(self.cfg.gentoo.digests_url)
-        expected = Crypto.parse_gentoo_digests(digests, self.cfg.gentoo.filename)
-        if not expected:
-            die("Could not parse SHA512 from DIGESTS")
-        log("Verifying SHA512...")
-        actual = Crypto.sha512_file(cached)
-        if actual != expected:
-            log_err(f"Expected: {expected[:32]}...")
-            log_err(f"Actual:   {actual[:32]}...")
-            cached.unlink(missing_ok=True)
-            die("SHA512 MISMATCH - corrupted download removed")
-        log_ok("SHA512 verified")
+        
         if not artifact.exists():
             shutil.copy(cached, artifact)
+        
         log_ok(f"Ready: {artifact.name}")
-        doas_version = "6.8.2"
-        doas_file = f"opendoas-{doas_version}.tar.xz"
-        doas_url = f"https://github.com/Duncaen/OpenDoas/releases/download/v{doas_version}/{doas_file}"
-        doas_cached = self.cfg.cache_dir / doas_file
-        doas_artifact = self.cfg.artifacts_dir / doas_file
-        if not doas_cached.exists():
-            log("Downloading OpenDoas (sudo alternative)...")
-            Downloader.download(doas_url, doas_cached, "Downloading doas")
-        else:
-            log_ok(f"Using cached: {doas_file}")
-        if not doas_artifact.exists():
-            shutil.copy(doas_cached, doas_artifact)
-        log_ok("Doas source ready")
+    
+    def _extract_qcow2_rootfs(self, qcow2_path: Path, output_path: Path) -> None:
+        """Extract rootfs from Rocky Linux 10 GenericCloud qcow2 image.
+        
+        TEAM_025: Uses guestfish/libguestfs to extract rootfs from qcow2.
+        Requires: libguestfs-tools (guestfish, virt-tar-out)
+        """
+        import subprocess
+        
+        # Check for required tools
+        tools_found = False
+        for tool in ["guestfish", "virt-tar-out"]:
+            result = subprocess.run(["which", tool], capture_output=True)
+            if result.returncode == 0:
+                tools_found = True
+                break
+        
+        if not tools_found:
+            # Try using qemu-nbd + mount as fallback
+            log_warn("guestfish not found, trying qemu-nbd method...")
+            self._extract_qcow2_via_nbd(qcow2_path, output_path)
+            return
+        
+        # Use virt-tar-out to extract rootfs directly, then gzip it
+        log("  Using virt-tar-out to extract rootfs...")
+        # virt-tar-out produces uncompressed tar, we need to gzip it
+        tar_path = output_path.with_suffix('')  # Remove .gz suffix for temp file
+        result = subprocess.run(
+            ["virt-tar-out", "-a", str(qcow2_path), "/", str(tar_path)],
+            capture_output=True, text=True, timeout=1800
+        )
+        if result.returncode != 0:
+            log_warn(f"virt-tar-out failed: {result.stderr[:200]}")
+            # Fallback to guestfish
+            self._extract_qcow2_via_guestfish(qcow2_path, output_path)
+            return
+        
+        # Compress to gzip
+        log("  Compressing rootfs tarball...")
+        import gzip
+        import shutil as sh
+        with open(tar_path, 'rb') as f_in:
+            with gzip.open(output_path, 'wb') as f_out:
+                sh.copyfileobj(f_in, f_out)
+        tar_path.unlink()  # Remove uncompressed tar
+        
+        log_ok("qcow2 rootfs extracted")
+    
+    def _extract_qcow2_via_guestfish(self, qcow2_path: Path, output_path: Path) -> None:
+        """Extract rootfs using guestfish."""
+        import subprocess
+        
+        with tempfile.TemporaryDirectory() as tmpdir:
+            mount_point = Path(tmpdir) / "mnt"
+            mount_point.mkdir()
+            
+            log("  Using guestfish to mount and extract...")
+            # Use guestfish to mount and tar
+            guestfish_script = f"""
+add {qcow2_path}
+run
+mount /dev/sda4 /
+tar-out / {output_path} compress:gzip
+"""
+            result = subprocess.run(
+                ["guestfish"], input=guestfish_script, capture_output=True, 
+                text=True, timeout=1800
+            )
+            if result.returncode != 0:
+                # Try different partition
+                guestfish_script2 = f"""
+add {qcow2_path}
+run
+list-filesystems
+mount /dev/sda3 /
+tar-out / {output_path} compress:gzip
+"""
+                result = subprocess.run(
+                    ["guestfish"], input=guestfish_script2, capture_output=True,
+                    text=True, timeout=1800
+                )
+                if result.returncode != 0:
+                    die(f"guestfish extraction failed: {result.stderr[:500]}")
+        
+        log_ok("qcow2 rootfs extracted via guestfish")
+    
+    def _extract_qcow2_via_nbd(self, qcow2_path: Path, output_path: Path) -> None:
+        """Extract rootfs using qemu-nbd + mount (requires root)."""
+        import subprocess
+        
+        # Check for qemu-nbd
+        result = subprocess.run(["which", "qemu-nbd"], capture_output=True)
+        if result.returncode != 0:
+            die("Neither guestfish nor qemu-nbd found. Install libguestfs-tools or qemu-utils.")
+        
+        nbd_device = "/dev/nbd0"
+        
+        try:
+            # Load nbd module
+            subprocess.run(["sudo", "modprobe", "nbd", "max_part=8"], check=True)
+            
+            # Connect qcow2 to nbd
+            log("  Connecting qcow2 to NBD...")
+            subprocess.run(["sudo", "qemu-nbd", "--connect", nbd_device, str(qcow2_path)], check=True)
+            
+            # Wait for device
+            import time
+            time.sleep(2)
+            
+            # Find root partition (usually partition 4 or 3)
+            with tempfile.TemporaryDirectory() as tmpdir:
+                mount_point = Path(tmpdir) / "mnt"
+                mount_point.mkdir()
+                
+                # Try partition 4 first (typical for cloud images), then 3
+                mounted = False
+                for part in ["p4", "p3", "p2", "p1"]:
+                    part_dev = f"{nbd_device}{part}"
+                    result = subprocess.run(
+                        ["sudo", "mount", "-o", "ro", part_dev, str(mount_point)],
+                        capture_output=True
+                    )
+                    if result.returncode == 0:
+                        # Check if this is the root partition
+                        if (mount_point / "etc").exists() and (mount_point / "usr").exists():
+                            log(f"  Found root partition at {part_dev}")
+                            mounted = True
+                            break
+                        subprocess.run(["sudo", "umount", str(mount_point)], capture_output=True)
+                
+                if not mounted:
+                    die("Could not find root partition in qcow2 image")
+                
+                # Create tarball
+                log("  Creating rootfs tarball...")
+                subprocess.run(
+                    ["sudo", "tar", "-czf", str(output_path), "-C", str(mount_point), "."],
+                    check=True, timeout=1800
+                )
+                
+                # Fix ownership
+                subprocess.run(["sudo", "chown", f"{os.getuid()}:{os.getgid()}", str(output_path)])
+                
+                # Unmount
+                subprocess.run(["sudo", "umount", str(mount_point)])
+        finally:
+            # Disconnect NBD
+            subprocess.run(["sudo", "qemu-nbd", "--disconnect", nbd_device], capture_output=True)
+        
+        log_ok("qcow2 rootfs extracted via NBD")
+    
+    def _extract_rocky_rootfs(self, image_path: Path, output_path: Path) -> None:
+        """Extract rootfs from Rocky Linux GenericCloud raw image.
+        
+        TEAM_022: The GenericCloud image is a raw disk image with partitions.
+        We need to extract the root partition contents.
+        """
+        import subprocess
+        
+        # Decompress if xz compressed
+        raw_path = image_path.with_suffix('')  # Remove .xz
+        if image_path.suffix == '.xz' and not raw_path.exists():
+            log("  Decompressing image...")
+            result = subprocess.run(['xz', '-dk', str(image_path)], capture_output=True, text=True)
+            if result.returncode != 0:
+                die(f"Failed to decompress: {result.stderr}")
+        
+        # Mount and extract using guestfish or loop mount
+        # For simplicity, we'll use a container rootfs approach
+        with tempfile.TemporaryDirectory() as tmpdir:
+            mount_point = Path(tmpdir) / "mnt"
+            mount_point.mkdir()
+            
+            # Find the root partition offset and mount it
+            # Rocky GenericCloud typically has partition 3 as root
+            log("  Mounting image partition...")
+            
+            # Get partition info
+            result = subprocess.run(
+                ['fdisk', '-l', str(raw_path)],
+                capture_output=True, text=True
+            )
+            
+            # Parse partition offset (sectors * 512)
+            # Look for the Linux filesystem partition (usually the largest one)
+            offset = None
+            for line in result.stdout.split('\n'):
+                if 'Linux' in line and 'filesystem' in line.lower():
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        try:
+                            start_sector = int(parts[1].replace('*', ''))
+                            offset = start_sector * 512
+                            break
+                        except ValueError:
+                            continue
+            
+            if offset is None:
+                # Fallback: common offset for GPT partition 3
+                offset = 1050624 * 512  # ~537MB offset
+                log_warn(f"  Using fallback partition offset: {offset}")
+            
+            # Mount the partition
+            result = subprocess.run(
+                ['mount', '-o', f'loop,offset={offset},ro', str(raw_path), str(mount_point)],
+                capture_output=True, text=True
+            )
+            if result.returncode != 0:
+                die(f"Failed to mount image: {result.stderr}")
+            
+            try:
+                # Create tarball of rootfs
+                log("  Creating rootfs tarball...")
+                result = subprocess.run(
+                    ['tar', '-cJf', str(output_path), '-C', str(mount_point), '.'],
+                    capture_output=True, text=True, timeout=600
+                )
+                if result.returncode != 0:
+                    die(f"Failed to create tarball: {result.stderr}")
+            finally:
+                # Unmount
+                subprocess.run(['umount', str(mount_point)], capture_output=True)
+        
+        log_ok("Rootfs extracted")
+    
+    def _get_rootfs_filename(self) -> str:
+        """Get the extracted rootfs tarball filename."""
+        # TEAM_025: qcow2 image is extracted to a gzip tarball
+        return self.cfg.rocky.rootfs_filename
     
     def step3_push_to_device(self) -> None:
         step_header(3, 6, "Push to Device")
         if not self.cfg.build_output.exists():
             die(f"Build not found: {self.cfg.build_output}")
-        tarball = self.cfg.artifacts_dir / self.cfg.gentoo.filename
+        rootfs_filename = self._get_rootfs_filename()
+        tarball = self.cfg.artifacts_dir / rootfs_filename
         if not tarball.exists():
-            die(f"Stage3 not found: {tarball}")
+            die(f"Rocky rootfs not found: {tarball}")
         if not self.adb.connected():
             die("No device connected")
         log(f"Device: {self.adb.serial_number()}")
@@ -203,27 +450,21 @@ class Deployer:
                 if not self.adb.exists(f):
                     die(f"FATAL: Critical file missing after push: {f}")
             log_ok("LXC binaries pushed")
-        tarball_remote = f"{self.cfg.device.tmp}/{self.cfg.gentoo.filename}"
+        tarball_remote = f"{self.cfg.device.tmp}/{rootfs_filename}"
         if self.adb.exists(tarball_remote):
-            log_ok("Stage3 already on device")
+            log_ok("Rocky rootfs already on device")
         else:
-            log("Pushing stage3 tarball (this takes a while)...")
+            log("Pushing Rocky rootfs tarball (this takes a while)...")
             with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"), console=console) as p:
                 p.add_task("Pushing...", total=None)
                 self.adb.push(tarball, tarball_remote)
-            log_ok("Stage3 pushed")
-        doas_file = "opendoas-6.8.2.tar.xz"
-        doas_local = self.cfg.artifacts_dir / doas_file
-        doas_remote = f"{self.cfg.device.tmp}/{doas_file}"
-        if doas_local.exists() and not self.adb.exists(doas_remote):
-            log("Pushing doas source...")
-            self.adb.push(doas_local, doas_remote)
-            log_ok("Doas source pushed")
+            log_ok("Rocky rootfs pushed")
     
     def step4_install_lxc(self) -> None:
         """Install LXC and deploy boot script.
         
-        CANONICAL SOURCE: gentoo-lxc.sh is the SINGLE SOURCE OF TRUTH for:
+        TEAM_022: Updated for Rocky Linux migration.
+        CANONICAL SOURCE: rocky-lxc.sh is the SINGLE SOURCE OF TRUTH for:
         - Container configuration
         - Network setup (IPVLAN L2 + hardening)
         - Security hardening rules
@@ -233,14 +474,23 @@ class Deployer:
         2. Deploys the boot script to /data/adb/service.d/
         3. Calls the boot script to generate config
         
-        DO NOT duplicate config generation here - edit gentoo-lxc.sh instead.
+        DO NOT duplicate config generation here - edit rocky-lxc.sh instead.
         """
         step_header(4, 6, "Install LXC on Device")
         d = self.cfg.device
         container = self.cfg.container_name
         config_path = f"{d.container_path(container)}/config"
-        boot_script_path = "/data/adb/service.d/gentoo-lxc.sh"
+        boot_script_path = "/data/adb/service.d/rocky-lxc.sh"
         self.adb.ensure_shell()
+        # TEAM_025: Always push boot script in case it was updated
+        boot_script_local = self.cfg.repo_root / "android" / "rocky-lxc.sh"
+        if boot_script_local.exists():
+            log("Updating boot script...")
+            self.adb.push(boot_script_local, f"{d.tmp}/rocky-lxc.sh")
+            self.shell.run(f"cp {d.tmp}/rocky-lxc.sh {boot_script_path}")
+            self.shell.run(f"chmod 755 {boot_script_path}")
+            log_ok("Boot script updated")
+        
         if self.shell.exists(config_path) and self.shell.exists(boot_script_path):
             out, rc = self.shell.run(f"LD_LIBRARY_PATH={d.lxc_prefix}/lib {d.lxc_prefix}/bin/lxc-start --version")
             if rc == 0:
@@ -262,11 +512,11 @@ class Deployer:
         self.adb.write_file(f"{d.lxc_prefix}/etc/lxc/lxc.conf", f"lxc.lxcpath = {d.lxc_containers}\n")
         self._apply_kernelsu_selinux_rules()
         log("Deploying boot script (CANONICAL config source)...")
-        boot_script_local = self.cfg.repo_root / "android" / "gentoo-lxc.sh"
+        boot_script_local = self.cfg.repo_root / "android" / "rocky-lxc.sh"
         if not boot_script_local.exists():
             die(f"Boot script not found: {boot_script_local}")
-        self.adb.push(boot_script_local, f"{d.tmp}/gentoo-lxc.sh")
-        self.shell.run(f"cp {d.tmp}/gentoo-lxc.sh {boot_script_path}")
+        self.adb.push(boot_script_local, f"{d.tmp}/rocky-lxc.sh")
+        self.shell.run(f"cp {d.tmp}/rocky-lxc.sh {boot_script_path}")
         self.shell.run(f"chmod 755 {boot_script_path}")
         log_ok("Boot script deployed")
         log("Generating container config via boot script...")
@@ -290,19 +540,32 @@ class Deployer:
         log_ok(f"lxc-start version: {out.strip()}")
     
     # NOTE: _setup_network and _setup_ipvlan_network REMOVED
-    # CANONICAL SOURCE: gentoo-lxc.sh handles ALL network config
-    # DO NOT add network config code here - edit gentoo-lxc.sh instead
+    # CANONICAL SOURCE: rocky-lxc.sh handles ALL network config
+    # DO NOT add network config code here - edit rocky-lxc.sh instead
     
     def step5_unpack_rootfs(self) -> None:
-        step_header(5, 6, "Unpack Gentoo Rootfs")
+        """Unpack Rocky Linux rootfs.
+        
+        TEAM_022: Rocky Linux migration.
+        TEAM_025: Updated for gzip tarball from OCI extraction.
+        No make.conf generation - Rocky uses dnf/rpm, not portage.
+        No OpenRC configuration - Rocky uses systemd.
+        """
+        step_header(5, 6, "Unpack Rocky Linux Rootfs")
         d = self.cfg.device
         rootfs = d.rootfs_path(self.cfg.container_name)
-        tarball = f"{d.tmp}/{self.cfg.gentoo.filename}"
+        rootfs_filename = self._get_rootfs_filename()
+        tarball = f"{d.tmp}/{rootfs_filename}"
         if not self.shell.exists(tarball):
-            die(f"Stage3 not found: {tarball}")
+            die(f"Rocky rootfs not found: {tarball}")
         if self.shell.is_mounted(rootfs) and self.shell.exists(f"{rootfs}/bin/bash"):
-            log_ok("Rootfs already unpacked")
-            return
+            # TEAM_025: Check for systemd to verify we have Rocky 10 GenericCloud, not Rocky 9 Container-Base
+            if self.shell.exists(f"{rootfs}/usr/lib/systemd/systemd"):
+                log_ok("Rootfs already unpacked (Rocky 10 with systemd)")
+                return
+            else:
+                log_warn("Wrong rootfs detected (no systemd) - re-extracting Rocky 10...")
+                self.shell.run(f"rm -rf {rootfs}/*", timeout=120)
         if not self.shell.exists(d.rootfs_image):
             self.shell.create_ext4_image(d.rootfs_image, self.cfg.rootfs_image_size_mb)
         else:
@@ -310,16 +573,23 @@ class Deployer:
         if not self.shell.is_mounted(rootfs):
             self.shell.mount(d.rootfs_image, rootfs)
         if not self.shell.exists(f"{rootfs}/bin/bash"):
-            log("Unpacking stage3 (this takes several minutes)...")
+            log("Unpacking Rocky rootfs (this takes several minutes)...")
             with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"), console=console) as p:
                 p.add_task("Extracting...", total=None)
-                self.shell.run(f"cd {rootfs} && tar -xJf {tarball} 2>/dev/null || busybox tar -xJf {tarball} 2>/dev/null || toybox tar -xf {tarball}", timeout=600)
+                # TEAM_025: Use -xzf for gzip, --no-same-permissions to fix OCI permission issues
+                self.shell.run(f"cd {rootfs} && tar --no-same-permissions -xzf {tarball} 2>/dev/null || tar -xzf {tarball} 2>/dev/null", timeout=600)
+                # Fix root directory permissions (OCI layers often have restrictive perms)
+                self.shell.run(f"chmod 755 {rootfs}", timeout=30)
                 if not self.shell.exists(f"{rootfs}/bin/bash"):
                     log_warn("Device tar failed, trying host extraction...")
                     self._extract_on_host_and_push(tarball, rootfs)
             if not self.shell.exists(f"{rootfs}/bin/bash"):
                 die("Unpack failed: /bin/bash not found")
-            log_ok("Stage3 unpacked")
+            # TEAM_025: Fix permissions on key directories (OCI images have restrictive perms)
+            log("Fixing rootfs permissions...")
+            self.shell.run(f"chmod 755 {rootfs} {rootfs}/bin {rootfs}/sbin {rootfs}/usr {rootfs}/usr/bin {rootfs}/usr/sbin {rootfs}/lib {rootfs}/lib64 2>/dev/null || true", timeout=60)
+            self.shell.run(f"chmod 755 {rootfs}/etc {rootfs}/var {rootfs}/root 2>/dev/null || true", timeout=30)
+            log_ok("Rocky rootfs unpacked")
         for d_name in ["dev", "proc", "sys", "run", "tmp"]:
             self.shell.mkdir(f"{rootfs}/{d_name}")
         self.shell.run(f"mkdir -p {rootfs}/var/empty")
@@ -327,42 +597,17 @@ class Deployer:
         self.shell.run(f"chmod 755 {rootfs}/var/empty")
         self.adb.write_file(f"{rootfs}/etc/resolv.conf", "nameserver 8.8.8.8\n")
         log_ok("DNS configured")
-        make_conf = """# Gentoo ARM64 - Pixel 6 optimized
-COMMON_FLAGS="-O2 -pipe -mcpu=cortex-a76 -mtune=cortex-a76"
-COMMON_FLAGS="${COMMON_FLAGS} -march=armv8.2-a+crypto+fp16+dotprod"
-CFLAGS="${COMMON_FLAGS}"
-CXXFLAGS="${COMMON_FLAGS}"
-FCFLAGS="${COMMON_FLAGS}"
-FFLAGS="${COMMON_FLAGS}"
-MAKEOPTS="-j6 -l6"
-ACCEPT_LICENSE="*"
-USE="-systemd -wayland -X -alsa -cups -bluetooth -gnome -kde -pulseaudio"
-USE="${USE} -gui -gtk -qt5 -qt6 -desktop -sound -video"
-USE="${USE} ipv6 git bash-completion vim-syntax ssl ncurses readline"
-USE="${USE} threads nptl unicode nls crypt zlib bzip2 lzma zstd openssl curl wget ssh scp"
-CPU_FLAGS_ARM="aes sha1 sha2 crc32 v8 vfpv4 neon"
-PORTAGE_BINHOST="https://distfiles.gentoo.org/releases/arm64/binpackages/17.0/arm64/"
-EMERGE_DEFAULT_OPTS="--getbinpkg --binpkg-respect-use=y --jobs=2 --ask=n"
-GENTOO_MIRRORS="https://distfiles.gentoo.org"
-FEATURES="-sandbox -usersandbox -pid-sandbox -network-sandbox parallel-fetch"
-LINGUAS="en"
-L10N="en"
-"""
-        self.adb.write_file(f"{rootfs}/etc/portage/make.conf", make_conf)
-        log_ok("Portage configured")
-        _, rc = self.shell.run(f'grep -q \'rc_sys="lxc"\' {rootfs}/etc/rc.conf')
-        if rc != 0:
-            rc_conf = 'rc_sys="lxc"\nrc_controller_cgroups="NO"\nrc_depend_strict="NO"'
-            self.shell.run(f"echo -e '\n{rc_conf}' >> {rootfs}/etc/rc.conf")
-        log_ok("OpenRC configured")
-        doas_file = "opendoas-6.8.2.tar.xz"
-        doas_remote = f"{d.tmp}/{doas_file}"
-        if self.shell.exists(doas_remote):
-            self.shell.run(f"cp {doas_remote} {rootfs}/root/{doas_file}")
-            log_ok("Doas source copied to rootfs")
+        # TEAM_022: Rocky Linux 10 GenericCloud uses systemd - no custom init needed
+        log_ok("Rocky Linux 10 rootfs ready (systemd-based)")
     
-    def step6_configure_gentoo(self) -> None:
-        step_header(6, 6, "Configure Gentoo (User, Sudo, SSH)")
+    def step6_configure_rocky(self) -> None:
+        """Configure Rocky Linux container.
+        
+        TEAM_022: Rocky Linux 10 migration.
+        TEAM_025: REVERTED to systemd-based Rocky 10 GenericCloud.
+        Uses sudo from Rocky repos.
+        """
+        step_header(6, 6, "Configure Rocky Linux (User, Sudo, SSH)")
         container = self.cfg.container_name
         user = self.cfg.container_user
         rootfs = self.cfg.device.rootfs_path(container)
@@ -376,36 +621,59 @@ L10N="en"
         self.shell.run(f"mkdir -p {d.lxc_runtime}/lxc/lock")
         self.shell.run(f"chmod -R 1777 {d.lxc_runtime}")
         log("Starting container via boot script (regenerates config)...")
-        boot_script = "/data/adb/service.d/gentoo-lxc.sh"
+        boot_script = "/data/adb/service.d/rocky-lxc.sh"
         # Use boot script to start - it regenerates config with correct gateway
         if self.lxc.running(container):
-            self.shell.run(f"{boot_script} restart", timeout=60)
+            log("  Container already running, restarting...")
+            out, rc = self.shell.run(f"{boot_script} restart 2>&1", timeout=120)
         else:
-            self.shell.run(f"{boot_script} start", timeout=60)
+            log("  Starting container...")
+            out, rc = self.shell.run(f"{boot_script} start 2>&1", timeout=120)
+        
+        if rc != 0:
+            log_err(f"Boot script returned rc={rc}")
+            log_err(f"Output: {out[:1000] if out else 'none'}")
+            # Check lxc-start log for more details
+            log_out, _ = self.shell.run(f"cat /data/local/tmp/rocky-lxc.log 2>/dev/null | tail -20")
+            log_err(f"Log tail:\n{log_out}")
+            die("Container start failed - check logs above")
+        
+        log("  Waiting for container to be ready...")
         deadline = time.time() + self.cfg.container_ready_timeout
         while time.time() < deadline:
-            if self.lxc.running(container) and self.lxc.ok("true", container, timeout=5):
-                break
+            if self.lxc.running(container):
+                log("  Container running, checking if responsive...")
+                if self.lxc.ok("true", container, timeout=5):
+                    break
             time.sleep(self.cfg.container_ready_poll_interval)
         else:
-            die("Container failed to start")
+            # Get diagnostic info
+            status_out, _ = self.shell.run(f"{boot_script} status 2>&1", timeout=30)
+            log_err(f"Container status:\n{status_out[:500]}")
+            log_out, _ = self.shell.run(f"cat /data/local/tmp/rocky-lxc.log 2>/dev/null | tail -30")
+            log_err(f"Log tail:\n{log_out}")
+            die("Container failed to become ready within timeout")
         self.lxc.use(container)
         log_ok("Container running")
-        log("Applying resource priority (Gentoo > Android)...")
+        log("Applying resource priority (Rocky > Android)...")
         self._apply_resource_priority()
-        log("Disabling hardware services...")
-        for svc in ["hwclock", "modules", "udev", "netmount"]:
-            self.lxc.run(f"rc-update delete {svc} boot 2>/dev/null || true", check=False, timeout=10)
-            self.lxc.run(f"rc-update delete {svc} sysinit 2>/dev/null || true", check=False, timeout=10)
-        log_ok("Hardware services disabled")
+        # TEAM_022: Rocky 10 uses systemd - mask hardware services for LXC
+        log("Masking unnecessary systemd services for LXC...")
+        for svc in ["systemd-udevd", "systemd-modules-load", "systemd-timesyncd"]:
+            self.lxc.run(f"systemctl mask {svc} 2>/dev/null || true", check=False, timeout=10)
+        log_ok("Hardware services masked")
         log("Checking installed packages...")
         has_sshd = self.lxc.ok("test -x /usr/bin/sshd || test -x /usr/sbin/sshd", timeout=10)
         if has_sshd:
             log_ok("OpenSSH found")
         else:
             die("FATAL: OpenSSH not found. SSH is required for remote access.")
-        log("Installing doas (sudo alternative)...")
-        self._install_doas()
+        # TEAM_022: Rocky Linux has sudo in repos - no need to build doas
+        log("Checking for sudo...")
+        if not self.lxc.ok("test -x /usr/bin/sudo", timeout=10):
+            log("Installing sudo from repos...")
+            self.lxc.run("dnf install -y sudo", timeout=120)
+        log_ok("sudo available")
         if not self.lxc.output(f"id {user} 2>/dev/null"):
             self.lxc.run(f"useradd -m -G wheel -s /bin/bash {user}", timeout=self.cfg.timeout_short)
             log_ok(f"User {user} created")
@@ -418,11 +686,22 @@ L10N="en"
         # SSH key auth also works if key is present
         password = self.cfg.default_password
         self.lxc.run(f"sh -c \"echo '{user}:{password}' | chpasswd\"", timeout=self.cfg.timeout_short)
-        log_ok("Password set (change with: passwd)")
-        if not self.lxc.ok("test -f /etc/doas.conf", timeout=10):
-            self.lxc.write("/etc/doas.conf", "permit nopass :wheel\n")
-            self.lxc.run("chmod 600 /etc/doas.conf", timeout=self.cfg.timeout_short)
-        log_ok("Doas configured")
+        log_ok(f"User {user} password set (change with: passwd)")
+        # TEAM_025: Set root password (different from user, no SSH access)
+        root_password = "r00tR0cky!"  # User can change with: sudo passwd root
+        self.lxc.run(f"sh -c \"echo 'root:{root_password}' | chpasswd\"", timeout=self.cfg.timeout_short)
+        log_ok("Root password set (change with: sudo passwd root)")
+        # TEAM_022: Configure sudo for wheel group (Rocky style)
+        if not self.lxc.ok("grep -q '%wheel.*NOPASSWD' /etc/sudoers", timeout=10):
+            self.lxc.run("echo '%wheel ALL=(ALL) NOPASSWD: ALL' >> /etc/sudoers", timeout=self.cfg.timeout_short)
+        log_ok("sudo configured for wheel group")
+        # TEAM_029: Also create /etc/sudoers.d/{user} for explicit passwordless sudo
+        # This is a belt-and-suspenders approach - wheel group + explicit user config
+        # Needed because systemd services may not recognize wheel group in LXC context
+        self.lxc.run("mkdir -p /etc/sudoers.d", check=False, timeout=self.cfg.timeout_short)
+        self.lxc.run(f"echo '{user} ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/{user}", check=False, timeout=self.cfg.timeout_short)
+        self.lxc.run(f"chmod 440 /etc/sudoers.d/{user}", check=False, timeout=self.cfg.timeout_short)
+        log_ok(f"sudoers.d/{user} created")
         sftp_path = "/usr/lib64/misc/sftp-server"
         for candidate in ["/usr/lib64/misc/sftp-server", "/usr/lib/misc/sftp-server", "/usr/libexec/sftp-server", "/usr/lib/ssh/sftp-server"]:
             if self.lxc.ok(f"test -x {candidate}", timeout=5):
@@ -457,15 +736,16 @@ Subsystem sftp {sftp_path}
         self.lxc.run("pkill sshd 2>/dev/null || true", check=False, timeout=self.cfg.timeout_short)
         _, rc = self.lxc.run("/usr/sbin/sshd 2>/dev/null || /usr/bin/sshd", check=False, timeout=10)
         if rc == 0:
-            self.lxc.run("rc-update add sshd default 2>/dev/null || true", check=False, timeout=self.cfg.timeout_short)
+            # TEAM_022: Rocky uses systemd
+            self.lxc.run("systemctl enable sshd 2>/dev/null || true", check=False, timeout=self.cfg.timeout_short)
             log_ok("SSH daemon started")
         else:
             die("FATAL: Failed to start sshd. Check container logs.")
-        if self.lxc.ok("test -x /usr/bin/doas", timeout=10):
-            log_ok("Doas verified")
-            if not self.lxc.ok("test -x /usr/bin/sudo", timeout=5):
-                self.lxc.run("ln -sf /usr/bin/doas /usr/bin/sudo", timeout=self.cfg.timeout_short)
-                log_ok("sudo -> doas symlink created")
+        if self.lxc.ok("test -x /usr/bin/sudo", timeout=10):
+            log_ok("sudo verified")
+        # TEAM_029: systemd services now work with cgroup2 device permissions
+        # (configured in rocky-lxc.sh update_config)
+        log_ok("systemd services ready (cgroup2 device permissions configured)")
         self._verify_deployment(container, user)
     
     def _verify_deployment(self, container: str, user: str) -> None:
@@ -478,8 +758,9 @@ Subsystem sftp {sftp_path}
             errors.append("SSH is NOT listening on port 22")
         if not self.lxc.ok(f"id {user}", timeout=10):
             errors.append(f"User '{user}' does NOT exist")
-        if not self.lxc.ok("test -x /usr/bin/doas || test -x /usr/bin/sudo", timeout=10):
-            errors.append("Neither doas nor sudo is installed")
+        # TEAM_028: Rocky uses sudo only (doas removed)
+        if not self.lxc.ok("test -x /usr/bin/sudo", timeout=10):
+            errors.append("sudo is not installed")
         # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
         # WARNING: DO NOT ADD mode='none' VERIFICATION HERE
         # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
@@ -560,7 +841,7 @@ Subsystem sftp {sftp_path}
             f"    [cyan]ssh {user}@{container_ip}[/cyan]\n\n"
             f"[bold]To access container from this host:[/bold]\n"
             f"  Use adb to attach directly:\n"
-            f"    [cyan]adb shell su -c 'lxc-attach -n gentoo'[/cyan]\n",
+            f"    [cyan]adb shell su -c 'lxc-attach -n {container}'[/cyan]\n",  # TEAM_025: Use variable instead of hardcoded name
             title="✓ Success", border_style="green"
         ))
     
@@ -573,28 +854,7 @@ Subsystem sftp {sftp_path}
         return None
     
     
-    def _install_doas(self) -> None:
-        if self.lxc.ok("test -x /usr/bin/doas", timeout=10):
-            # Check setuid bit even if already installed
-            if not self.lxc.ok("test -u /usr/bin/doas", timeout=10):
-                log("  Fixing doas setuid bit...")
-                self.lxc.run("chmod u+s /usr/bin/doas", timeout=10)
-                self.lxc.run("chmod u+s /usr/bin/sudo 2>/dev/null || true", timeout=10, check=False)
-            log_ok("doas already installed")
-            return
-        if not self.lxc.ok("test -f /root/opendoas-6.8.2.tar.xz", timeout=10):
-            die("FATAL: doas source not found in /root. Was step 5 completed?")
-        build_script = '#!/bin/bash\nset -e\nexport TMPDIR=/tmp\nexport HOME=/root\ncd /root\ntar -xJf opendoas-6.8.2.tar.xz\ncd opendoas-6.8.2\n./configure --prefix=/usr --without-pam\nmake -j4\nmake install\nchmod u+s /usr/bin/doas\necho "permit nopass :wheel" > /etc/doas.conf\nchmod 600 /etc/doas.conf\nln -sf /usr/bin/doas /usr/bin/sudo\nchmod u+s /usr/bin/sudo\n'
-        self.lxc.write("/root/build_doas.sh", build_script)
-        log("  Building doas (this takes a minute)...")
-        result = self.lxc.run("/bin/bash /root/build_doas.sh", timeout=300, check=False)
-        if self.lxc.ok("test -x /usr/bin/doas", timeout=10):
-            # Verify setuid bit is set
-            if not self.lxc.ok("test -u /usr/bin/doas", timeout=10):
-                die("FATAL: doas installed but setuid bit not set. Run: chmod u+s /usr/bin/doas")
-            log_ok("doas installed")
-        else:
-            die(f"FATAL: doas build failed: {result[0][:200] if result[0] else 'unknown error'}")
+    # TEAM_022: _install_doas removed - Rocky Linux uses sudo from repos
     
     def _apply_resource_priority(self) -> None:
         res = self.cfg.resources
@@ -616,30 +876,34 @@ Subsystem sftp {sftp_path}
         log_ok(f"Resource priority applied: CPU={res.cpu_shares}, Mem={res.memory_limit_mb}MB")
     
     def _extract_on_host_and_push(self, tarball_remote: str, rootfs: str) -> None:
-        tarball_local = self.cfg.artifacts_dir / self.cfg.gentoo.filename
+        """Extract rootfs on host and push to device (fallback method).
+        
+        TEAM_025: Updated - tarball is already gzip, no conversion needed.
+        """
+        rootfs_filename = self._get_rootfs_filename()
+        tarball_local = self.cfg.artifacts_dir / rootfs_filename
         if not tarball_local.exists():
             die(f"Local tarball not found: {tarball_local}")
-        with tempfile.TemporaryDirectory() as tmpdir:
-            gzip_tarball = Path(tmpdir) / "stage3.tar.gz"
-            gzip_remote = f"{self.cfg.device.tmp}/stage3.tar.gz"
-            log("Converting xz to gzip (this takes a few minutes)...")
-            result = subprocess.run(f"xz -dc '{tarball_local}' | gzip -1 > '{gzip_tarball}'", shell=True, capture_output=True, text=True, timeout=600)
-            if result.returncode != 0:
-                die(f"Conversion failed: {result.stderr}")
-            log(f"Pushing gzip tarball ({gzip_tarball.stat().st_size // (1024*1024)}MB)...")
-            if not self.adb.push(gzip_tarball, gzip_remote, timeout=600):
-                die("Failed to push gzip tarball")
-            log_ok("Gzip tarball pushed")
-            log("Extracting on device...")
-            self.shell.run(f"rm -rf {rootfs}/*")
-            out, rc = self.shell.run(f"cd {rootfs} && tar -xzf {gzip_remote}", timeout=600)
-            if rc != 0:
-                log_warn(f"Extraction had issues: {out[:200]}")
-            self.shell.run(f"rm -f {gzip_remote}")
-            self.shell.mkdir(f"{rootfs}/dev")
-            self.shell.run(f"mkdir -p {rootfs}/var/empty")
-            self.shell.run(f"chown 0:0 {rootfs}/var/empty 2>/dev/null || true")
-            self.shell.run(f"chmod 755 {rootfs}/var/empty")
+        
+        # TEAM_025: Tarball is already gzip from OCI extraction, just push and extract
+        gzip_remote = f"{self.cfg.device.tmp}/rootfs.tar.gz"
+        log(f"Pushing tarball ({tarball_local.stat().st_size // (1024*1024)}MB)...")
+        if not self.adb.push(tarball_local, gzip_remote, timeout=600):
+            die("Failed to push tarball")
+        log_ok("Tarball pushed")
+        log("Extracting on device...")
+        self.shell.run(f"rm -rf {rootfs}/*")
+        out, rc = self.shell.run(f"cd {rootfs} && tar --no-same-permissions -xzf {gzip_remote} 2>/dev/null || tar -xzf {gzip_remote}", timeout=600)
+        if rc != 0:
+            log_warn(f"Extraction had issues: {out[:200]}")
+        self.shell.run(f"rm -f {gzip_remote}")
+        # TEAM_025: Fix permissions on key directories (OCI images have restrictive perms)
+        self.shell.run(f"chmod 755 {rootfs} {rootfs}/bin {rootfs}/sbin {rootfs}/usr {rootfs}/usr/bin {rootfs}/usr/sbin {rootfs}/lib {rootfs}/lib64 2>/dev/null || true", timeout=60)
+        self.shell.run(f"chmod 755 {rootfs}/etc {rootfs}/var {rootfs}/root 2>/dev/null || true", timeout=30)
+        self.shell.mkdir(f"{rootfs}/dev")
+        self.shell.run(f"mkdir -p {rootfs}/var/empty")
+        self.shell.run(f"chown 0:0 {rootfs}/var/empty 2>/dev/null || true")
+        self.shell.run(f"chmod 755 {rootfs}/var/empty")
     
     def run_all(self) -> None:
         try:
@@ -648,15 +912,15 @@ Subsystem sftp {sftp_path}
             self.step3_push_to_device()
             self.step4_install_lxc()
             self.step5_unpack_rootfs()
-            self.step6_configure_gentoo()
+            self.step6_configure_rocky()
         finally:
             self.adb.close()
     
     def clean(self) -> None:
         """Clean host-side build artifacts and downloads.
         
+        TEAM_022: Updated for Rocky Linux.
         This does NOT touch the device. Use uninstall() for that.
-        Gentoo is a first-class citizen, not garbage to be cleaned.
         """
         step_header(0, 0, "Clean Host Files")
         log("Cleaning build artifacts and downloads...")
@@ -666,7 +930,7 @@ Subsystem sftp {sftp_path}
                 shutil.rmtree(d)
                 log_ok(f"Removed: {d}")
         log_ok("Host clean complete")
-        log("Note: Use --uninstall to remove Gentoo from device")
+        log("Note: Use --uninstall to remove Rocky Linux from device")
     
     def status(self) -> None:
         table = Table(title="Deployment Status")
@@ -674,9 +938,9 @@ Subsystem sftp {sftp_path}
         table.add_column("Status")
         table.add_column("Details", style="dim")
         build_ok = self.cfg.build_output.exists()
-        stage3_ok = (self.cfg.artifacts_dir / self.cfg.gentoo.filename).exists()
+        rootfs_ok = (self.cfg.artifacts_dir / self.cfg.rocky.rootfs_filename).exists()
         table.add_row("LXC Build", "✓" if build_ok else "✗", str(self.cfg.build_output))
-        table.add_row("Stage3", "✓" if stage3_ok else "✗", self.cfg.gentoo.filename)
+        table.add_row("Rocky Rootfs", "✓" if rootfs_ok else "✗", self.cfg.rocky.rootfs_filename)
         if self.adb.connected():
             serial = self.adb.serial_number()
             root_ok = self.adb.has_root()

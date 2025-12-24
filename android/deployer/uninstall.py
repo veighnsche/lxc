@@ -300,11 +300,14 @@ class Uninstaller:
         step.status = StepStatus.RUNNING
         log("Removing boot scripts...")
         
+        # TEAM_025: Added Rocky scripts alongside Gentoo for backward compatibility
         scripts = [
             "/data/adb/service.d/gentoo-lxc.sh",
             "/data/adb/service.d/gentoo-shell.sh",
+            "/data/adb/service.d/rocky-lxc.sh",
             "/data/local/tmp/g",
             "/data/local/tmp/gentoo-shell.sh",
+            "/data/local/tmp/rocky-lxc.sh",
         ]
         
         removed = 0
@@ -423,12 +426,16 @@ class Uninstaller:
         log("Cleaning temp files...")
         
         d = self.cfg.device
+        # TEAM_025: Added Rocky patterns alongside Gentoo for backward compatibility
         patterns = [
             f"{d.tmp}/stage3*.tar.xz",
             f"{d.tmp}/stage3*.tar.gz",
+            f"{d.tmp}/rocky-*.tar.xz",
             f"{d.tmp}/gentoo-*.sh",
+            f"{d.tmp}/rocky-*.sh",
             f"{d.tmp}/lxc-*.tar.gz",
             f"{d.tmp}/gentoo-lxc.log",
+            f"{d.tmp}/rocky-lxc.log",
         ]
         
         try:
